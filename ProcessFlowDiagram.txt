@@ -1,0 +1,231 @@
+Process Flow Diagram for iam_log_intelligence_agent_hybridChunking2.py. In stages with boxes and descriptions for boxes.
+
+NOTE (Slowness_DuckDB branch): This diagram accurately describes the legacy server_monitoring path (hybrid time-window chunking + dedup + embedding + z-score anomaly scoring + FAISS). The current opt-in production path for UAM server statistics / resource logs is the completely separate DuckDB + agentic SQL loop (see Claude.md §2.2 "3B. Server Monitoring Path", server_metrics.py, and analysis.py:331). The API request path and all public contracts remain identical to the pre-DuckDB behaviour. The boxes describing the old server chunking/scoring stages (approx. Box 7–25) are now secondary / exercised only by direct calls outside the main analyze_single_file flow.
+
+Entry Point (Command Line Interface) [Boxes 1]
+-----------------------------------
+
+Box 1 Title: Program Start (__main__) | Description: The script checks sys.argv. If command-line arguments are provided (one or more file/folder paths), it enters batch mode, collecting all log files from all paths and running the full Map-Reduce pipeline. If no argument is provided, it starts interactive mode.
+
+File Discovery [Boxes 2 and 3]
+-----------------------------------
+
+Box 2 Title: Collect Paths from CLI Iterate sys.argv[1:] | Description: The program iterates over every path argument provided on the command line. Each path is checked with os.path.exists(). Invalid paths print a warning and are skipped. Valid paths are passed to get_log_files_from_path().
+
+Box 3 Title: Stage 1: File Discovery | Description: If the path is a single file: returns it immediately as a one-element list (absolute path).
+If the path is a directory: recursively walks the entire directory. Only files with extensions .log, .txt, .out, .err, or .msg are collected. All discovered files are converted to absolute paths. The function prints how many files were found. All files from all input paths are merged into a single flat list all_log_files.
+
+
+Map Phase Loop (All processes here will loop per-file) [Boxes 4 to 36]
+-----------------------------------------------------------------------
+
+Box 4: Query Routing and Subcategory Detection | Description: The pipeline loads retrieval signals from search_config.json and routes each file analysis using classify_query_category(query_text, category_keywords, api_known_error_keywords).
+
+If no query text is provided, category defaults to api_request.
+
+The LLM router returns category, confidence, reason, and fallback_used. If confidence is below ROUTER_MIN_CONFIDENCE, deterministic keyword fallback is used.
+
+If category is api_request, classify_api_subcategory() labels known_error or unknown_error so downstream prompts can focus error handling behaviour.
+
+Box 5: Read Sample Lines | Description: Uses stream_file_lines() a memory-efficient generator that reads one line at a time using Python's file iterator (never loads the whole file into memory). The first 1,200 lines are collected into a list called sample_lines. These are used exclusively for schema detection. If the file is empty or unreadable, the function returns early with empty findings.
+
+Box 6: Stage 2a: Auto-Detect Log Schema | Description: (a) Timestamp detection: Tests 6 timestamp regex patterns. The first pattern that matches >30% of the detection pool is selected. A corresponding strptime format string is stored alongside. If none match, a dummy NOTIMESTAMP regex is used (will never match any line).
+
+(b) Thread-ID detection: Tests 6 thread-name regex patterns: Tomcat NIO executor (http-nio2-8080-exec-307), Tomcat other styles, generic word-word-num-num, named workers (AM EventWorker-1-46), WebSphere hex thread IDs (000000c9), and a broad fallback [threadName]. The first pattern matching >20% of detection pool lines is selected.
+
+(c) Session/transaction key detection: Tests 6 key-value patterns across a wider window (up to 400 primary lines): txId, SESSION_ID/sessionId, IID, USER_ID/userId, e2eeSid, correlationId. Any matched key is retained as parsing metadata (fallback context), not as a dedicated session-based chunking dimension.
+
+(d) Stack-trace regex: A hardcoded compiled regex is stored that identifies continuation lines: lines starting with whitespace + at, Caused by:, ... N more, or bare exception class names.
+
+Output: A dict with timestamp_re, timestamp_fmt, thread_re, session_keys, and stack_trace_re. Up to 200 primary (non-continuation) lines are used as the detection pool. If regex confidence is low, the optional hybrid schema detector may be attempted before proceeding.
+
+
+Stage 2b: Query-Time Validation and Filtering | Description: Before scoring or deterministic extraction, the pipeline computes per-file time coverage from the source file and validates query window overlap. If query time range is outside file coverage, the file is marked invalid_query_window and excluded from final report synthesis. filter_docs_by_query_window() keeps chunks overlapping requested time boundaries.
+
+
+Stage 2c: Adaptive Chunking (Category-Aware)
+
+Box 7: Routing Decision for Chunking Strategy | Description: The chunking path is selected by query category.
+
+If category = api_request, use extract_api_request_docs_deterministic(file_path, schema, boundaries, retrieval_signals, query_context) and skip embedding/anomaly scoring entirely.
+
+If category = server_monitoring, use chunk_server_monitoring_log(file_path, schema) with fixed 5-minute windows (SERVER_MONITOR_WINDOW_SECONDS = 300) and no-timestamp monitor catch-all handling.
+
+Otherwise, use the server_monitoring hybrid chunking path (Boxes 8 to 12), then continue into Stage 2.5 and Stage 3.
+
+Box 8: 1. Parse Every Line: | Description: [SERVER_MONITORING PATH ONLY] Every line in the file is streamed and parsed. Each line is first stripped of any [Line NNN] prefix (added by some pre-filter tools). Then:
+
+Timestamp extraction: The schema's timestamp_re is applied. If matched, the raw timestamp string is extracted. For WebSphere logs that use colons before milliseconds (HH:MM:SS:mmm), the last colon is normalised to a dot (HH:MM:SS.mmm) so Python's strptime with %f can parse it. The result is a datetime object or None.
+
+Primary key extraction: Thread-first parsing is used for chunk grouping. The schema's thread_re is applied first and thread identity drives grouped chunk construction.
+
+Stack-trace continuation inheritance: If a line has no primary key and matches stack-trace continuation regex, it inherits the preceding primary key so exception blocks stay grouped.
+
+Output per line: A tuple of (timestamp | None, primary_key | None, cleaned_text).
+
+Box 9: 2. Thread Group Chunking: | Description: Each thread key's line list is converted into one or more Document objects.
+
+If total characters ≤ 15,000 (MAX_GROUP_CHARS): a single Document is created.
+
+If total characters > 15,000: lines are chronologically split into sub-chunks with 500-char overlap (CHUNK_OVERLAP_CHARS) for context continuity.
+
+Metadata includes source_file, primary_key, key_type, start_time, end_time, line_count, and sub_index.
+
+Box 10: 3. Time-Window Sliding (Ungrouped + Timestamped). | Description: [SERVER_MONITORING PATH ONLY] Ungrouped lines are split into two pools: with timestamp and without timestamp.
+
+Timestamped ungrouped lines are sorted chronologically, then processed with a sliding window: window size = 2 minutes (UNGROUPED_WINDOW_SECONDS = 120), step size = 30 seconds. Oversized windows are further split by line count to control chunk size.
+
+Because windows overlap, the same line can appear in multiple time-window chunks. This is intentional and preserves temporal boundary context.
+
+Box 11: 4. Catch all Remaining Chunks. | Description: [SERVER_MONITORING PATH ONLY] Lines with no timestamp and no primary key are batched sequentially into chunks of up to 10,000 characters (NO_TS_CATCH_ALL_CHARS). Each chunk gets key_type='no_timestamp' and primary_key='unstructured'. These chunks are lower-priority unless they contain error-bearing or IAM-critical clues.
+
+Box 12: Output (Base Chunks). | Description: [SERVER_MONITORING PATH ONLY] The hybrid chunker returns Documents with metadata fields such as source_file, primary_key, key_type (thread | time_window | no_timestamp), start_time, end_time, line_count, and sub_index.
+
+Box 13: API Deterministic Request Extraction (api_request only) | Description: For api_request category, extract_api_request_docs_deterministic() scans the file line by line, groups request lifecycles by thread key, and uses start_markers and end_markers from search_config.json to build request spans. Each line is parsed with schema-aware timestamp and key handling, then checked against the query window before it is considered for extraction. The function maintains active request state per thread key so a start marker opens a request span and an end marker closes it into a Document. If a thread begins a new request before the previous span is closed, the earlier span is flushed with unmatched_exit=True. When the file ends, any still-open spans are also flushed with unmatched_exit=True so no request lifecycle is dropped silently. Strong standalone lines that satisfy the signal rules are emitted as key_type='api_signal_event' when they are not part of an active span.
+
+The deterministic score is computed directly in _deterministic_score rather than through FAISS or z-score anomaly scoring. The base score starts at 0.0, then IAM-critical terms add IAM_CRITICAL_SCORE_BOOST (4.0), error-bearing terms add ERROR_SCORE_BOOST (2.0), and request boundary evidence adds another 1.0 when matched_start or matched_end is present. If a noise pattern matches, the score is clamped with min(score, 1.0). Any span or signal event that contains IAM-critical, error-bearing, or boundary-marker evidence is marked signal_candidate=True so it can participate in evidence ranking later.
+
+
+Stage 2.5: Pre-Embedding Compression (Large Logs Only) [server_monitoring path only]
+
+If chunk count is >= Large_Log_trigger of 3000, proceed to run conservative dedup. Logs less than 3000 chunks will be processed as normal.
+    1. For each chunk, check if it is error bearing, containing  any of _ERROR_KEYWORDS such as ERROR, Exception, Failed etc.
+    2. Canonicalize text by replacing volatile tokes such as timestamp, UUID, hex etc. This normalizes chunks with the same existing pattern.
+    3. Build SHA1 hash of canonical text. Provides a deterministic, compact identity for fast exact/canonical matching at scale.
+    4. Keep first representative chunk; merge duplicates into it
+
+After conservative dedup, if chunk count is >= 12,000, proceed to run very large downselection
+    1. Load retrieval signals from search_config.json.
+    2. Reduce each chunk to diagnostic lines only for signal matching, dropping stack-frame-only lines before checking IAM-critical and error-bearing status.
+    3. Priority-rank all chunks by: i, IAM-critical presence, ii, error-bearing flag, iii, dedup count, iv, line count.
+    4. Keep IAM-critical and error chunks first until cap.
+    5. If space remains, fill using round-robin across key_type buckets (thread, time_window, no_timestamp) to preserve structural diversity.
+    6. Hard cap number of chunks to 6,000 before embedding. This is a pre-embedding safety cap for extremely large logs, not a retrieval bucket stage.
+
+
+Stage 3a: Signal Filtering [server_monitoring path only]
+
+After chunking and optional deduplication, the pipeline checks only the diagnostic lines of each chunk, not stack-frame-only lines. It assigns three related labels:
+
+IAM-critical = the chunk contains an IAM-domain clue from search_config.json (for example decryptValueAsBinary, AuthenticationException).
+
+Error-bearing = the chunk contains a generic failure clue such as Exception, Failed, FATAL, or Caused by:.
+
+signal_candidate = a boolean flag written into the chunk's metadata. When True, the chunk is included in the anomaly-scoring pool passed to Stage 3b and is later treated as a priority seed in Stage 4. The flag is set to True by the following rule: if the chunk is IAM-critical, it is always tagged True, no further checks. If the chunk is error-bearing but NOT IAM-critical, it is tagged True only if it does NOT simultaneously match both a noise pattern AND have key_type='no_timestamp' (an unstructured catch-all with no thread and no timestamp).
+
+The filter keeps all signal_candidate chunks first. If that pool is too small, it backfills with cleaner non-noisy thread/time-window chunks, then less-preferred noisy context if still needed.(48 Chunks minimum set for now). This creates a reduced anomaly-scoring pool and prevents fallback noise from dominating the ranked seed set. These signal_candidate chunks also become the strongest candidates for the Stage 4 ranked seeds.
+
+
+Stage 3b: Embedding & Anomaly Scoring [server_monitoring path only]
+
+Box 19: Embed candidate chunks. | Description: [SERVER_MONITORING PATH ONLY] Only the filtered candidate chunks are embedded through llm_factory.get_embeddings(), so the concrete provider can be OpenAI or Bedrock depending on .env. Texts are truncated to EMBEDDING_MAX_CHARS before embedding to stay within provider request limits. Embedding runs with bounded concurrency and retry/backoff handling. The result is a 2D NumPy float32 array of shape (n_docs, embedding_dim).
+
+Box 20: Sample Reference Set. | Description: [SERVER_MONITORING PATH ONLY] 25% of all retained candidate chunks (ANOMALY_REF_SAMPLE_RATIO = 0.25) are randomly sampled to form the "normal" reference set, capped at 600 chunks (ANOMALY_REF_MAX). The assumption (from the Ladle paper) is that in any log file, the majority of retained content is still routine enough to approximate the file's baseline.
+
+Box 21: Build FAISS Baseline Index. | Description: [SERVER_MONITORING PATH ONLY] A raw faiss.IndexFlatL2 (exact L2/Euclidean distance, no approximation) index is built from only the reference set's embeddings. This index represents "what normal looks like" in embedding space. This is an in-memory, brute-force index used only for anomaly scoring.
+
+Box 22: Query Distances (kNN). | Description: [SERVER_MONITORING PATH ONLY] Every retained chunk's embedding is queried against the FAISS index to find the k=6 nearest neighbours (ANOMALY_K_NEIGHBOURS). The Euclidean distances to those 6 neighbours are returned. The mean of these 6 distances is computed for each chunk, this is the chunk's "raw distance" from the normal baseline. Anomalous or unusual chunks will have a higher mean distance because they are far from the "normal" reference embeddings.
+
+Box 23: Compute Baseline Statistics. | Description: [SERVER_MONITORING PATH ONLY] Only the reference set's mean distances are used to compute baseline statistics. The distances are sorted, and the top and bottom 10% are trimmed (winsorised removal of extreme values). From the remaining middle 80%, the trimmed_mean and std (standard deviation) are calculated. If std < 1e-6 (near-zero, indicating all reference chunks are identical), it is clamped to 1.0 to prevent division by zero.
+
+Box 24: Z-Score Computation. | Description: [SERVER_MONITORING PATH ONLY] For every chunk, the z-score is computed: z = (mean_kNN_distance − trimmed_mean) / std_dev. A z-score of 0 means the chunk is exactly as "normal" as the baseline. Higher z-scores indicate greater statistical anomaly. The z-score and raw distance are written into each Document's metadata as anomaly_score and raw_distance.
+
+Box 25: Three-Tier Score Adjustment. | Description: [SERVER_MONITORING PATH ONLY] After raw z-scores are computed, chunks containing IAM-critical keywords loaded from search_config.json receive an explicit score boost: +2.0 (ERROR_SCORE_BOOST) + +4.0 (IAM_CRITICAL_SCORE_BOOST) = +6.0 total. Noise clamping can cap noisy infrastructure chunks at 1.0 so they do not dominate the evidence window.
+
+Box 25.5: Sort, Persist, Cleanup. | Description: [SERVER_MONITORING PATH ONLY]
+
+All Documents are sorted in descending order by their final anomaly_score. The count of "high-anomaly" chunks (z-score > 2.5, ANOMALY_HIGH_THRESHOLD) is logged.
+
+The FAISS reference index, the full candidate embedding matrix, and chunk metadata (content + all metadata fields) are saved under outputs/faiss/faiss_index_{filename}/ for post-analysis:
+  - index.faiss  
+  - embeddings.npy   
+  - metadata.json    
+
+The in-memory FAISS index and NumPy embedding arrays are then deleted and gc.collect() is called. The api_request path does not enter this stage because it already has deterministic anomaly_score values and skips embeddings entirely.
+
+
+Stage 4: Merge & Budget-Enforce Evidence - Combines ranked evidence sources into a single formatted string for the LLM, enforcing context budget limits. Both api_request and server_monitoring paths converge here.
+
+For api_request, anomaly_score used in ranking comes from deterministic scoring in Box 13 (not FAISS/z-score distance).
+
+Box 26: Step 1: Build group index. | Description: Creates a lookup (source_file, primary_key) -> [indices] so neighbours within the same thread chain can be found quickly.
+
+Box 27: Step 2: Select ranked top-N seeds. | Description: The top MAP_TOP_N_CHUNKS = 60 seeds are selected with a signal-first sort: signal_candidate first, then IAM-critical, then error-bearing, then anomaly score. A seed is simply an initial anchor chunk chosen before neighbour expansion. This prevents high-scoring fallback noise from outranking true diagnostic chunks.
+
+Scoring source note: server_monitoring uses anomaly_score from Stage 3b z-score pipeline; api_request uses anomaly_score from Box 13 deterministic scoring.
+
+Box 28: Step 3: Add temporal/thread neighbours. | Description: For each selected seed, include MAP_NEIGHBOUR_RADIUS = 2 chunks before and after in the same group to preserve local causality context.
+
+Box 29: Step 4: Priority sorting + total cap. | Description: The combined set is sorted with ranked seeds ahead of neighbours, then signal-bearing chunks ahead of fallback context, then IAM-critical, then error-bearing, then anomaly score descending. This ensures that if the budget truncates the evidence, the most diagnostic chunks appear first in the LLM's context window. The list is capped at MAP_MAX_CHUNKS = 150.
+
+Box 30: Format with citation IDs and smart truncation. | Description: 
+
+Step 5: Format with citation IDs and budget enforcement:
+Each chunk gets a header line containing:
+
+[score=X.XX] - the final anomaly score
+[REF_{filename}_{primarykey}_{rank}] - the citation ID the LLM must use
+[source=ranked:signal|ranked:fallback|neighbour] - how it was included
+[file=...], [key=...], [startTime -> endTime]
+Smart truncation (per-chunk):
+
+Error-bearing chunks (containing Exception, Error, Failed, FATAL, etc.): kept up to 8,000 chars (ERROR_CHUNK_MAX_CHARS) - full diagnostic detail preserved.
+Benign chunks: truncated to 2,000 chars (BENIGN_CHUNK_MAX_CHARS).
+URL decoding: Any URL-encoded segments (%24 -> $, %3D -> =, + -> space, %26amp; -> &) are decoded via decode_url_encoded_errors() so the LLM sees human-readable error messages.
+
+Hard budget cap: Chunks are appended to the output string until MAP_EVIDENCE_BUDGET_CHARS = 200,000 chars is reached. Any remaining chunks are skipped with a warning.
+
+Box 32: Output (Evidence Text). | Description: Final output is a single evidence string with strict [REF_...] identifiers for citation-bound LLM analysis.
+
+
+Stage 5: Map Phase (LLM Analysis)
+
+Box 33: Per-File LLM Forensic Analysis. | Description: LLM PROMPT (provider selected by llm_factory.py and .env)
+"You are an expert IAM forensic analyst. Analyze this evidence and produce a final incident report. STRICT RULE: Every claim MUST include a [REF_ID] citation pointing to the evidence ........"
+
+All file's documents objects with their embedding metadata is deleted to ensure no file's chunks are held in memory during another file's processing.
+
+Box 35: Per-File Output Payload. | Description: Successful map output returns a dictionary containing file name, findings markdown, chunk_count, high_anomaly_count, routing metadata (category/subcategory/confidence/fallback), source_path, FAISS artifact path, debug evidence path, and metadata_rows for follow-up UI display.
+
+high_anomaly_count is computed from anomaly_score > ANOMALY_HIGH_THRESHOLD in both paths; for api_request this threshold is applied on deterministic scores from Box 13.
+
+Stage 6: Reduce Phase
+---------------------------------
+
+Box 37: all_findings = [                                                                                          
+{ "file": "180-ticket.txt", "findings": [...] },
+{ "file": "iam1.log", "findings": [...] },
+{ "file": "iam2.log", "findings": [...] },
+] 
+
+Box 38: consolidate_reports(all_findings) | Description:
+1. Skip invalid query-window reports.
+2. Skip empty findings (typically map LLM errors).
+3. Truncate each file findings to REDUCE_PER_FILE_CAP_CHARS = 8,000.
+4. Build compiled evidence casefile with file metadata.
+5. Enforce total reduce budget REDUCE_EVIDENCE_BUDGET_CHARS = 160,000.
+
+Box 39: Final Consolidation LLM Prompt. | Description: Final report prompt requires cross-file correlation and strict evidence grounding. It forbids recommendations/remediation and mandates only four output sections:
+1. Executive Summary
+2. Root Cause Analysis
+3. Verified Evidence
+4. Analysis Boundaries
+
+Box 40: LLM Response (Final Report) | Description: Returns consolidated markdown incident report. On reduce LLM failure, returns explicit "# AGENT ERROR" report instead of silent empty output.
+
+Box 40.5: Post-Analysis Context Storage for Chatbot | Description: After PDF export in run_pipeline(), app.py calls build_analysis_context() to construct a session-scoped AnalysisContext object containing query_text, log_path, start_time, end_time, report_text, and entries[] of ArtifactEntry objects. Each entry carries file_name, source_path, faiss_index_dir, debug_evidence_file, metadata_rows, selected reduce row IDs, category, and subcategory. The result is stored in st.session_state.analysis_context so follow-up chat queries can reuse artifacts without rerunning the full pipeline.
+
+Final Stage: Chatbot Application Flow (app.py)
+------------------------------
+
+Box 41: Streamlit Session + Sidebar Initialization | Description: app.py initializes Streamlit session state for messages, vector store, analysis context, pending UI command, and retrieved-chunks panel state. Sidebar captures log path, optional incident start/end times, and provides "View Retrieved Rows" for api_request contexts or "View Retrieved Chunks" for server_monitoring contexts when an analysis context exists.
+
+Box 42: User Message Entry and Routing Decision | Description: User input from the chat box is appended to chat history and evaluated against current analysis context scope (same log path and time window).
+
+Box 44: Retrieved Chunks Interaction Panel | Description: When the user triggers "View Retrieved Rows" or "View Retrieved Chunks", app.py builds table payload from build_retrieved_chunks_table_data(context), shows sortable metadata rows (source file, key, key type, content preview, time range, line count), and supports hide/close interaction. API contexts show rows; server_monitoring contexts show chunks.
+
+Box 45: Chatbot Outputs | Description: The app returns assistant responses in chat for both modes:
+1. Full-analysis report response (pipeline result).
+2. Follow-up conversational response grounded on stored artifacts (FAISS metadata, debug evidence, raw logs, vector store).
+
+The PDF export still occurs in pipeline execution, but chatbot-visible output is the rendered markdown response and the optional retrieved-rows / retrieved-chunks evidence view.

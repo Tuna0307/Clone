@@ -1,0 +1,105 @@
+{
+  "search_strategy": "signal_first_anomaly_ranking",
+  "iam_critical_keywords": [
+    "decryptValueAsBinary",
+    "keyId=WrapAEK",
+    "WrapAEK",
+    "TokenException",
+    "AuthenticationException",
+    "VerificationFailed",
+    "SessionReplaced",
+    "SessionInvalid",
+    "sesToken",
+    "simCert",
+    "amsystem.properties",
+    "TokenNotActive",
+    "Too many users found"
+  ],
+  "error_keywords": [
+    "ERROR",
+    "Exception",
+    "FATAL",
+    "Failed",
+    "Refused",
+    "CRITICAL",
+    "SecurityException",
+    "SessionInvalid",
+    "VerificationFailed",
+    "NullPointerException",
+    "Caused by:",
+    "stack trace"
+  ],
+  "noise_patterns": [
+    "Audit took \\d+",
+    "refreshSession.*success",
+    "^\\s*INFO\\s.*\\bstarted\\b",
+    "^\\s*INFO\\s.*\\bhealthy\\b",
+    "ERRORCODE=.*SQLSTATE=",
+    "Connection\\s*(reset|refused)",
+    "ConnectException",
+    "Error opening socket to server",
+    "Start Display Current Environment",
+    "End Display Current Environment",
+    "log4j:WARN",
+    "\\[Fatal Error\\].*Premature end of file",
+    "\\[Fatal Error\\].*Element type",
+    "hql:\\s*select\\b"
+  ],
+  "category_keywords": {
+    "api_request": [
+      "api",
+      "request",
+      "response",
+      "endpoint",
+      "xmlrpc",
+      "login",
+      "logout",
+      "authorize",
+      "token",
+      "auth",
+      "saml"
+    ],
+    "server_monitoring": [
+      "cpu",
+      "memory",
+      "heap",
+      "thread pool",
+      "latency",
+      "throughput",
+      "gc",
+      "jvm",
+      "slow",
+      "timeout",
+      "resource",
+      "server"
+    ]
+  },
+  "api_known_error_keywords": [
+    "tokenexception",
+    "authenticationexception",
+    "verificationfailed",
+    "sessioninvalid",
+    "nullpointerexception",
+    "securityexception",
+    "hsm",
+    "pkcs11",
+    "wrapaek",
+    "errorcode",
+    "http 401",
+    "http 403",
+    "http 500"
+  ],
+  "api_request_boundaries": {
+    "start_markers": [
+      " - entry",
+      ":entry",
+      " entry,"
+    ],
+    "end_markers": [
+      " - exit",
+      ":exit",
+      " exit,",
+      "lapse(ms)="
+    ]
+  }
+}

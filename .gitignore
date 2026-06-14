@@ -1,0 +1,26 @@
+# Environment
+.env
+,env
+.venv/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Generated outputs
+outputs/
+*.pdf
+faiss_index_*/
+debug_evidence_*
+streamlit_uploads/
+
+# Local data
+SanitisedData/
+docs/superpowers/
+
+# OS
+.DS_Store
+Thumbs.db
+.github
