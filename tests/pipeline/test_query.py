@@ -28,11 +28,6 @@ def test_load_search_config_defaults():
     assert "iam_critical_keywords" in config
 
 
-def test_classify_query_category_fallback():
-    result = q._classify_query_category_fallback("high cpu usage", q._DEFAULT_CATEGORY_KEYWORDS)
-    assert result == "server_monitoring"
-
-
 def test_line_overlaps_query_window():
     ctx = {"start_time": datetime(2024, 1, 1), "end_time": datetime(2024, 1, 31)}
     assert q._line_overlaps_query_window(datetime(2024, 1, 15), ctx) is True

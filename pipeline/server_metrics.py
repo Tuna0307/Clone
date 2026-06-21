@@ -13,14 +13,15 @@ Reuses the existing _parse_line helper for timestamp + thread extraction.
 
 from __future__ import annotations
 
-import csv
+import multiprocessing
 import os
 import re
-import tempfile
 import time
+from concurrent.futures import ProcessPoolExecutor
 from typing import Any, Optional
 
 import duckdb
+import pandas as pd
 
 from pipeline.files import stream_file_lines
 from pipeline.progress import emit_ui_progress
@@ -33,6 +34,7 @@ from pipeline.constants import (
     _SIGNAL_QUICK_REJECT_RE,
 )
 
+_PARALLEL_THRESHOLD_BYTES: int = 50 * 1024 * 1024  # 50 MB
 
 # Exact table schema from the implementation prompt (non-negotiable)
 SERVER_METRICS_CREATE_SQL = """
@@ -59,13 +61,35 @@ LOG_EVENTS_CREATE_SQL = """
 CREATE TABLE IF NOT EXISTS log_events (
     timestamp TIMESTAMP,
     thread VARCHAR,
-    raw_line VARCHAR
+    raw_line VARCHAR,
+    has_latency BOOLEAN,
+    has_jdbc BOOLEAN,
+    has_ldap BOOLEAN,
+    has_hibernate BOOLEAN,
+    has_connection_wait BOOLEAN,
+    has_staleobject BOOLEAN,
+    has_sql BOOLEAN,
+    has_count_rows BOOLEAN,
+    has_entry_authz BOOLEAN,
+    has_rest BOOLEAN,
+    has_scheduled BOOLEAN,
+    method_sig VARCHAR,
+    latency_ms BIGINT,
+    result_count BIGINT,
+    scheduled_op_name VARCHAR
 );
 """
 
 LOG_EVENTS_INDEX_SQL = """
 CREATE INDEX IF NOT EXISTS idx_log_events_ts
 ON log_events(timestamp);
+"""
+
+LOG_EVENTS_FLAG_INDEX_SQL = """
+CREATE INDEX IF NOT EXISTS idx_log_events_latency_ms ON log_events(latency_ms);
+CREATE INDEX IF NOT EXISTS idx_log_events_result_count ON log_events(result_count);
+CREATE INDEX IF NOT EXISTS idx_log_events_method_sig ON log_events(method_sig);
+CREATE INDEX IF NOT EXISTS idx_log_events_scheduled_op ON log_events(scheduled_op_name);
 """
 
 SERVER_METRICS_WIDE_VIEW_SQL = """
@@ -119,17 +143,16 @@ SELECT
 FROM pivoted;
 """
 
-DUCKDB_TABLE_SCHEMA_TEXT = """**DuckDB table schemas (exact column names):**
-- `log_events`: `timestamp`, `thread`, `raw_line` — use `timestamp`, not `ts`.
-- `server_metrics` (raw EAV): `timestamp`, `thread`, `metric_name`, `metric_value`, `category`, `raw_line`.
-  Each metric snapshot is stored as multiple rows. Pivot with `CASE WHEN metric_name = '...' THEN metric_value END` or query `server_metrics_wide`.
-- `server_metrics_wide` (preferred for time-series): one row per snapshot with `timestamp`, `ts`, `thread_count`, `tomcat_busy_threads`, `tomcat_current_threads`, `dbcp_active_connections`, `dbcp_idle_connections`, `response_time_ms`, `hibernate_sessions`, and related pool columns.
+def _load_duckdb_schema_text() -> str:
+    from pipeline.prompt_loader import load_fragment
 
-**SQL rules:**
-- On `log_events`, always filter with `timestamp` (e.g. `le.timestamp BETWEEN ...`).
-- For pivoted metrics, prefer `FROM server_metrics_wide` instead of inventing wide columns on `server_metrics`.
-- `server_metrics_wide.ts` is an alias of `timestamp` for convenience."""
+    return load_fragment("reference.duckdb_schema")
 
+
+def _load_uam5_dictionary_text() -> str:
+    from pipeline.prompt_loader import load_fragment
+
+    return load_fragment("reference.uam5_dictionary")
 _WIDE_METRIC_COLUMNS: frozenset[str] = frozenset({
     "thread_count",
     "tomcat_busy_threads",
@@ -161,6 +184,14 @@ ALLOWED_CATEGORIES = {
     "deliveryManager",
     "eventManager",
 }
+_LOG_EVENTS_CHUNK_COLUMNS: list[str] = [
+    "timestamp", "thread", "raw_line",
+    "has_latency", "has_jdbc", "has_ldap", "has_hibernate",
+    "has_connection_wait", "has_staleobject", "has_sql",
+    "has_count_rows", "has_entry_authz", "has_rest", "has_scheduled",
+    "method_sig", "latency_ms", "result_count", "scheduled_op_name",
+]
+
 
 
 # =============================================================================
@@ -226,51 +257,16 @@ UAM5_MONITORING_METRICS: dict[str, list[dict[str, str]]] = {
     ],
 }
 
-# LLM-friendly markdown version of the dictionary (injected into the agent prompt)
-UAM5_SERVER_MONITORING_DICTIONARY_TEXT = """
-### System Information
-- am.serverName (String): Server ID of the particular UAM Instance being monitored
-- am.cachedSession (Integer): Session that is cached in memory
-- am.auth.responseTime (Double): Average Authentication Response Time (last 1000 samples)
-- am.auth.responseTime90th (Double): Authentication Response Time 90th percentile
-- jvm.freeMemory (Long): JVM Free Memory in bytes
-- jvm.threadCount (Integer): Current number of live threads
-- jvm.maxMemory (Long): Maximum JVM memory (-Xmx)
-- am.e2eeNonExpiredSessionCache (Integer): Count of E2EE sessions not yet expired
-- am.serverTime (Long): Server timestamp of the snapshot (epoch ms)
-- eventManager.threadPoolMaxSize (Integer)
-- eventManager.threadPoolQueueSize (Integer)
-- eventManager.threadPoolMaxQueueSize (Integer)
-- eventManager.threadPoolActiveCount (Integer)
-- eventManager.threadPoolRejectedCount (Long)
-- eventManager.threadPoolRejectedCountInTimeWindow (Long)
-
-### Tomcat
-- am.tomcat.connector.name (String): Tomcat Connector Name
-- am.tomcat.thread.current.count (Integer): Total threads in pool
-- am.tomcat.thread.busy.count (Integer): Busy threads serving requests
-
-### Hibernate
-- hibernate.sessionCount (Integer): Active Hibernate sessions
-- hibernate.relation2.cache.hitCount / missCount / elementInMemory
-- hibernate.baseobject.cache.hitCount / missCount / elementInMemory
-- hibernate.attr.cache.hitCount / missCount / elementInMemory
-
-### DBCP Connection Pool
-- dbcp.ActiveConnections (Integer)
-- dbcp.AllConnections (Integer)
-- dbcp.IdleConnections (Integer)
-
-### deliveryManager (Email Gateway)
-- deliveryManager.MRQ-EMAIL-GW.threadPoolActiveCount / MaxQueueSize / MaxSize / QueueSize / RejectedCount / RejectedCountInTimeWindow
-
-### deliveryManager (SMS Gateway)
-- deliveryManager.MRQ-SMS-GW.threadPoolActiveCount / MaxQueueSize / MaxSize / QueueSize / RejectedCount / RejectedCountInTimeWindow
-""".strip()
-
 # Robust key=value extractor (handles both "Server statistics={...}" and "msg={...}" forms)
 # Captures typical UAM metric names (am.*, jvm.*, hibernate.*, dbcp.*, eventManager.*, deliveryManager.*)
 _METRIC_RE = re.compile(r"([a-zA-Z][\w.]+)=([^,\s{}]+)")
+
+# Pre-compiled regexes for computing categorical flags during ingestion.
+# These replace repeated LIKE / regexp_extract scans on log_events.raw_line.
+_METHOD_SIG_RE = re.compile(r"([A-Za-z][A-Za-z0-9_\.]*(?:\.java)?:\d+)")
+_LATENCY_MS_RE = re.compile(r"lapse\(ms\)\s*=\s*(\d+)")
+_RESULT_COUNT_RE = re.compile(r"(?i)\b(Count|rows?|returned|result\s*(count|size)?)\s*[:=]?\s*(\d{3,})")
+_SCHEDULED_OP_RE = re.compile(r"([A-Za-z0-9_]+(?:TO|Job|Index|Task)[A-Za-z0-9_]*)")
 
 
 def _categorize_metric(metric_name: str) -> str:
@@ -287,6 +283,60 @@ def _categorize_metric(metric_name: str) -> str:
     if n.startswith("eventmanager."):
         return "eventManager"
     return "System Information"
+
+
+def _compute_log_event_flags(clean: str) -> dict[str, Any]:
+    """Return pre-computed categorical flags and extracted values for a log line.
+
+    Computing these once during ingestion eliminates repeated full-text
+    LIKE / regexp_extract scans in downstream diagnostic SQL.
+    """
+    lower = clean.lower()
+    flags: dict[str, Any] = {
+        "has_latency": "lapse" in lower,
+        "has_jdbc": "jdbc" in lower,
+        "has_ldap": "ldap" in lower,
+        "has_hibernate": "hibernate" in lower,
+        "has_connection_wait": "connection wait" in lower,
+        "has_staleobject": "staleobject" in lower,
+        "has_sql": "sql" in lower,
+        "has_count_rows": any(k in lower for k in ("count", "rows", "returned")),
+        "has_entry_authz": (
+            " - entry" in clean
+            or "rolevalidator" in lower
+            or "checkcredentialrole" in lower
+            or "getrelationsbyobj" in lower
+            or "getcredential" in lower
+        ),
+        "has_rest": "rest:" in lower,
+        "has_scheduled": any(k in lower for k in ("scheduled", "createindex", "batch", "cron")),
+        "method_sig": None,
+        "latency_ms": None,
+        "result_count": None,
+        "scheduled_op_name": None,
+    }
+
+    if ".java:" in clean or "(" in clean:
+        m = _METHOD_SIG_RE.search(clean)
+        if m:
+            flags["method_sig"] = m.group(1)
+
+    if flags["has_latency"]:
+        m = _LATENCY_MS_RE.search(clean)
+        if m:
+            flags["latency_ms"] = int(m.group(1))
+
+    if flags["has_count_rows"]:
+        m = _RESULT_COUNT_RE.search(clean)
+        if m:
+            flags["result_count"] = int(m.group(3))
+
+    if flags["has_scheduled"]:
+        m = _SCHEDULED_OP_RE.search(clean)
+        if m:
+            flags["scheduled_op_name"] = m.group(1)
+
+    return flags
 
 
 def _extract_metric_pairs(line: str) -> list[tuple[str, float]]:
@@ -345,6 +395,142 @@ def _score_signal(c: dict[str, Any]) -> int:
     return v if v > 0 else 1
 
 
+def _ingest_log_chunk(
+    file_path: str,
+    schema: dict,
+    start_offset: int,
+    end_offset: int | None,
+    query_context: Optional[dict[str, Any]] = None,
+    collect_signals: bool = False,
+) -> tuple[list[tuple], list[tuple], list[dict[str, Any]]]:
+    """Ingest a byte-aligned chunk of the log file in-process.
+
+    Returns (log_event_rows, metric_rows, signal_candidates).
+    Each log_event_row is a tuple matching the log_events table columns.
+    Each metric_row is a 6-tuple (ts, thread, name, value, category, raw_line).
+    """
+    log_rows: list[tuple] = []
+    metric_rows: list[tuple] = []
+    signal_candidates: list[dict[str, Any]] = []
+
+    for raw_line in stream_file_lines(file_path, start_offset=start_offset, end_offset=end_offset):
+        ts, thread, clean = _parse_line(raw_line, schema)
+
+        if not _line_overlaps_query_window(ts, query_context):
+            continue
+
+        thread_val = thread or ""
+        raw_for_db = clean[:2000] if len(clean) > 2000 else clean
+        flags = _compute_log_event_flags(clean)
+        log_rows.append((
+            ts, thread_val, raw_for_db,
+            flags["has_latency"], flags["has_jdbc"], flags["has_ldap"], flags["has_hibernate"],
+            flags["has_connection_wait"], flags["has_staleobject"], flags["has_sql"],
+            flags["has_count_rows"], flags["has_entry_authz"], flags["has_rest"], flags["has_scheduled"],
+            flags["method_sig"], flags["latency_ms"], flags["result_count"], flags["scheduled_op_name"],
+        ))
+
+        # Fast-path gate: only run metric regex on lines that actually carry metrics.
+        if "Server statistics" in clean or "msg=" in clean:
+            metric_pairs = _extract_metric_pairs(clean)
+            if metric_pairs:
+                for name, value in metric_pairs:
+                    category = _categorize_metric(name)
+                    metric_rows.append((ts, thread_val, name, value, category, raw_for_db))
+
+        if collect_signals:
+            signal = _scan_line_for_signal(clean)
+            if signal is not None:
+                signal["timestamp"] = ts
+                signal_candidates.append(signal)
+
+    return log_rows, metric_rows, signal_candidates
+
+
+def _compute_chunk_offsets(file_path: str, num_chunks: int) -> list[tuple[int, int]]:
+    """Return [(start, end), ...] byte ranges for roughly equal chunks.
+
+    End offsets align to newline boundaries so no line is split.
+    """
+    size = os.path.getsize(file_path)
+    if size == 0:
+        return [(0, 0)]
+    stride = size // num_chunks
+    offsets = [0]
+    with open(file_path, "rb") as f:
+        for i in range(1, num_chunks):
+            pos = min(i * stride, size)
+            f.seek(pos)
+            # Advance to next newline
+            while pos < size:
+                byte = f.read(1)
+                if not byte or byte == b"\n":
+                    break
+                pos += 1
+            offsets.append(pos + 1 if byte == b"\n" else pos)
+    offsets.append(size)
+    return list(zip(offsets[:-1], offsets[1:]))
+
+
+def _ingest_parallel(
+    file_path: str,
+    schema: dict,
+    conn: duckdb.DuckDBPyConnection,
+    query_context: Optional[dict[str, Any]] = None,
+    collect_signals: bool = False,
+    max_candidates: int = MAX_PRE_SCAN_CANDIDATES,
+    max_workers: int | None = None,
+) -> tuple[int, int, int, int, list[dict[str, Any]]]:
+    """Multi-process ingestion for large logs."""
+    size = os.path.getsize(file_path)
+    if max_workers is not None:
+        num_chunks = max_workers
+    else:
+        cpu_count = multiprocessing.cpu_count()
+        num_chunks = min(4, max(2, cpu_count - 1))
+    chunk_offsets = _compute_chunk_offsets(file_path, num_chunks)
+
+    print(f"  [Server] Parallel ingestion: {num_chunks} chunks, {len(chunk_offsets)} ranges")
+
+    lines_total = 0
+    all_signal_candidates: list[dict[str, Any]] = []
+
+    with ProcessPoolExecutor(max_workers=num_chunks) as exe:
+        futures = [
+            exe.submit(
+                _ingest_log_chunk,
+                file_path,
+                schema,
+                start,
+                end,
+                query_context,
+                collect_signals,
+            )
+            for start, end in chunk_offsets
+        ]
+        for fut in futures:
+            log_rows, metric_rows, signals = fut.result()
+            if log_rows:
+                df = pd.DataFrame(log_rows, columns=_LOG_EVENTS_CHUNK_COLUMNS)
+                conn.from_df(df).insert_into("log_events")
+            if metric_rows:
+                conn.executemany(
+                    "INSERT INTO server_metrics VALUES (?, ?, ?, ?, ?, ?)",
+                    metric_rows,
+                )
+            all_signal_candidates.extend(signals)
+            lines_total += len(log_rows)
+
+    metrics_total = conn.execute("SELECT COUNT(*) FROM server_metrics").fetchone()[0]
+    log_events_total = conn.execute("SELECT COUNT(*) FROM log_events").fetchone()[0]
+    lines_with_metrics = metrics_total
+
+    if collect_signals:
+        all_signal_candidates.sort(key=_score_signal, reverse=True)
+        return lines_total, lines_with_metrics, metrics_total, log_events_total, all_signal_candidates[:max_candidates]
+    return lines_total, lines_with_metrics, metrics_total, log_events_total, []
+
+
 def _ingest_server_log(
     file_path: str,
     schema: dict,
@@ -358,112 +544,27 @@ def _ingest_server_log(
     Returns (lines_total, lines_with_metrics, metrics_total, log_events_total, signals).
     When collect_signals=False the signals list is empty.
     """
-    metric_batch: list[tuple] = []
-    signal_candidates: list[dict[str, Any]] = []
-    BATCH_SIZE = 100_000
-
-    lines_total = 0
-    lines_with_metrics = 0
-    metrics_total = 0
-    log_events_total = 0
-    last_report_at = time.monotonic()
-    last_report_lines = 0
-    REPORT_INTERVAL_SECS = 5.0
-    REPORT_LINE_INTERVAL = 250_000
-
-    # Use a temporary CSV file + DuckDB COPY FROM for high-throughput
-    # log_events ingestion. This avoids Python executemany overhead entirely
-    # and lets DuckDB's C++ CSV parser load millions of rows in seconds.
-    log_csv_fd, log_csv_path = tempfile.mkstemp(suffix=".csv")
-    log_csv_file = None
-    try:
-        log_csv_file = open(log_csv_fd, "w", newline="", encoding="utf-8")
-        log_csv_writer = csv.writer(log_csv_file)
-        log_csv_writer.writerow(["timestamp", "thread", "raw_line"])  # header
-
-        def _flush_metric_batch() -> None:
-            nonlocal metrics_total
-            if not metric_batch:
-                return
-            conn.executemany(
-                "INSERT INTO server_metrics VALUES (?, ?, ?, ?, ?, ?)",
-                metric_batch,
-            )
-            metrics_total += len(metric_batch)
-            metric_batch.clear()
-
-        for raw_line in stream_file_lines(file_path):
-            lines_total += 1
-            ts, thread, clean = _parse_line(raw_line, schema)
-
-            if not _line_overlaps_query_window(ts, query_context):
-                continue
-
-            thread_val = thread or ""
-            # raw_for_db is truncated to 2000 chars for DB storage, but signal
-            # candidates preserve the full `clean` line for LLM context.
-            raw_for_db = clean[:2000]
-            # Write to temp CSV; DuckDB AUTO_DETECT handles ISO timestamps
-            ts_iso = ts.isoformat() if ts is not None else "\\N"
-            log_csv_writer.writerow([ts_iso, thread_val, raw_for_db])
-            log_events_total += 1
-
-            # Fast-path gate: only run metric regex on lines that actually carry metrics.
-            if "Server statistics" in clean or "msg=" in clean:
-                metric_pairs = _extract_metric_pairs(clean)
-                if metric_pairs:
-                    lines_with_metrics += 1
-                    for name, value in metric_pairs:
-                        category = _categorize_metric(name)
-                        metric_batch.append((ts, thread_val, name, value, category, raw_for_db))
-
-            if collect_signals:
-                signal = _scan_line_for_signal(clean)
-                if signal is not None:
-                    signal["timestamp"] = ts
-                    signal_candidates.append(signal)
-
-            if len(metric_batch) >= BATCH_SIZE:
-                _flush_metric_batch()
-
-            now = time.monotonic()
-            if (
-                lines_total % REPORT_LINE_INTERVAL == 0
-                or (now - last_report_at) >= REPORT_INTERVAL_SECS
-            ):
-                elapsed = now - last_report_at
-                interval_lines = lines_total - last_report_lines
-                rate = interval_lines / elapsed if elapsed > 0 else 0
-                print(
-                    f"  [Server] Parsing... {lines_total:,} lines scanned "
-                    f"({rate:,.0f} lines/s), {lines_with_metrics:,} metric lines, "
-                    f"{log_events_total:,} log events, "
-                    f"{metrics_total + len(metric_batch):,} metric rows so far "
-                    f"(elapsed: {elapsed:.0f}s)"
-                )
-                last_report_at = now
-                last_report_lines = lines_total
-
-        _flush_metric_batch()
-        log_csv_file.close()
-        log_csv_file = None  # mark as closed so finally doesn't re-close
-
-        # Bulk-load log_events from the temp CSV via DuckDB's native C++ parser
-        escaped_path = log_csv_path.replace("'", "''")
-        copy_sql = f"""COPY log_events FROM '{escaped_path}' (AUTO_DETECT TRUE, HEADER TRUE, NULLSTR '\\N', IGNORE_ERRORS TRUE)"""
-        conn.execute(copy_sql)
-    finally:
-        # Ensure the temp file is always closed and removed
-        if log_csv_file is not None:
-            try:
-                log_csv_file.close()
-            except (OSError, ValueError):
-                pass
-        try:
-            os.unlink(log_csv_path)
-        except OSError:
-            pass
-
+    size = os.path.getsize(file_path)
+    if size > _PARALLEL_THRESHOLD_BYTES:
+        return _ingest_parallel(
+            file_path, schema, conn, query_context, collect_signals, max_candidates
+        )
+    log_rows, metric_rows, signal_candidates = _ingest_log_chunk(
+        file_path, schema, start_offset=0, end_offset=None,
+        query_context=query_context, collect_signals=collect_signals,
+    )
+    lines_total = sum(1 for _ in stream_file_lines(file_path))
+    lines_with_metrics = len({r[0] for r in metric_rows})
+    metrics_total = len(metric_rows)
+    log_events_total = len(log_rows)
+    if log_rows:
+        df = pd.DataFrame(log_rows, columns=_LOG_EVENTS_CHUNK_COLUMNS)
+        conn.from_df(df).insert_into("log_events")
+    if metric_rows:
+        conn.executemany(
+            "INSERT INTO server_metrics VALUES (?, ?, ?, ?, ?, ?)",
+            metric_rows,
+        )
     if collect_signals:
         signal_candidates.sort(key=_score_signal, reverse=True)
         return lines_total, lines_with_metrics, metrics_total, log_events_total, signal_candidates[:max_candidates]
@@ -498,6 +599,7 @@ def _run_ingestion_and_index(
 
     conn.execute(SERVER_METRICS_INDEX_SQL)
     conn.execute(LOG_EVENTS_INDEX_SQL)
+    conn.execute(LOG_EVENTS_FLAG_INDEX_SQL)
     create_server_monitoring_views(conn)
     return result
 
@@ -603,61 +705,6 @@ def normalize_llm_sql(sql: str) -> str:
     )
 
     return normalized
-
-
-def load_server_metrics_into_duckdb(
-    file_path: str,
-    schema: dict,
-    query_context: Optional[dict[str, Any]] = None,
-    db_path: str = ":memory:",
-) -> duckdb.DuckDBPyConnection:
-    """Parse a server-monitoring log file and load metrics into DuckDB."""
-    t_start = time.monotonic()
-    conn = duckdb.connect(db_path)
-
-    lines_total, lines_with_metrics, metrics_total, log_events_total, _ = _run_ingestion_and_index(
-        file_path, schema, conn, query_context, collect_signals=False
-    )
-
-    elapsed = time.monotonic() - t_start
-    rate = lines_total / elapsed if elapsed > 0 else 0
-    print(
-        f"  [Server] DuckDB load complete: {lines_total:,} lines -> "
-        f"{metrics_total:,} metric rows + {log_events_total:,} log events "
-        f"in {elapsed:.1f}s ({rate:,.0f} lines/s)"
-    )
-    return conn
-
-
-def load_server_metrics_into_duckdb_with_signals(
-    file_path: str,
-    schema: dict,
-    query_context: Optional[dict[str, Any]] = None,
-    db_path: str = ":memory:",
-    max_candidates: int = MAX_PRE_SCAN_CANDIDATES,
-) -> tuple[duckdb.DuckDBPyConnection, list[dict[str, Any]]]:
-    """Single-pass loader that returns both a populated DuckDB connection and
-    high-signal event candidates discovered during the scan.
-
-    This eliminates the need for a separate pre_detect_high_signal_events pass.
-    """
-    t_start = time.monotonic()
-    conn = duckdb.connect(db_path)
-
-    lines_total, lines_with_metrics, metrics_total, log_events_total, signals = _run_ingestion_and_index(
-        file_path, schema, conn, query_context, collect_signals=True, max_candidates=max_candidates
-    )
-
-    elapsed = time.monotonic() - t_start
-    rate = lines_total / elapsed if elapsed > 0 else 0
-    load_message = (
-        f"DuckDB load + signal scan complete: {lines_total:,} lines -> "
-        f"{metrics_total:,} metric rows + {log_events_total:,} log events + {len(signals)} signals "
-        f"in {elapsed:.1f}s ({rate:,.0f} lines/s)"
-    )
-    print(f"  [Server] {load_message}")
-    emit_ui_progress(load_message)
-    return conn, signals
 
 
 def format_query_dataframe(df: Any, *, max_rows: int = 50) -> str:
@@ -812,6 +859,61 @@ def pre_detect_high_signal_events(
     return candidates[:max_candidates]
 
 
+def load_server_metrics_into_duckdb(
+    file_path: str,
+    schema: dict,
+    query_context: Optional[dict[str, Any]] = None,
+    db_path: str = ":memory:",
+) -> duckdb.DuckDBPyConnection:
+    """Parse a server-monitoring log file and load metrics into DuckDB."""
+    t_start = time.monotonic()
+    conn = duckdb.connect(db_path)
+
+    lines_total, lines_with_metrics, metrics_total, log_events_total, _ = _run_ingestion_and_index(
+        file_path, schema, conn, query_context, collect_signals=False
+    )
+
+    elapsed = time.monotonic() - t_start
+    rate = lines_total / elapsed if elapsed > 0 else 0
+    print(
+        f"  [Server] DuckDB load complete: {lines_total:,} lines -> "
+        f"{metrics_total:,} metric rows + {log_events_total:,} log events "
+        f"in {elapsed:.1f}s ({rate:,.0f} lines/s)"
+    )
+    return conn
+
+
+def load_server_metrics_into_duckdb_with_signals(
+    file_path: str,
+    schema: dict,
+    query_context: Optional[dict[str, Any]] = None,
+    db_path: str = ":memory:",
+    max_candidates: int = MAX_PRE_SCAN_CANDIDATES,
+) -> tuple[duckdb.DuckDBPyConnection, list[dict[str, Any]]]:
+    """Single-pass loader that returns both a populated DuckDB connection and
+    high-signal event candidates discovered during the scan.
+
+    This eliminates the need for a separate pre_detect_high_signal_events pass.
+    """
+    t_start = time.monotonic()
+    conn = duckdb.connect(db_path)
+
+    lines_total, lines_with_metrics, metrics_total, log_events_total, signals = _run_ingestion_and_index(
+        file_path, schema, conn, query_context, collect_signals=True, max_candidates=max_candidates
+    )
+
+    elapsed = time.monotonic() - t_start
+    rate = lines_total / elapsed if elapsed > 0 else 0
+    load_message = (
+        f"DuckDB load + signal scan complete: {lines_total:,} lines -> "
+        f"{metrics_total:,} metric rows + {log_events_total:,} log events + {len(signals)} signals "
+        f"in {elapsed:.1f}s ({rate:,.0f} lines/s)"
+    )
+    print(f"  [Server] {load_message}")
+    emit_ui_progress(load_message)
+    return conn, signals
+
+
 __all__ = [
     "load_server_metrics_into_duckdb",
     "load_server_metrics_into_duckdb_with_signals",
@@ -830,3 +932,12 @@ __all__ = [
     "UAM5_MONITORING_METRICS",
     "UAM5_SERVER_MONITORING_DICTIONARY_TEXT",
 ]
+
+
+def __getattr__(name: str):
+    """Lazy accessors for LLM reference text loaded via pipeline.prompt_loader."""
+    if name == "DUCKDB_TABLE_SCHEMA_TEXT":
+        return _load_duckdb_schema_text()
+    if name == "UAM5_SERVER_MONITORING_DICTIONARY_TEXT":
+        return _load_uam5_dictionary_text()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

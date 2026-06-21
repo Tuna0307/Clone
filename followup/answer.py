@@ -24,14 +24,9 @@ from followup.intent import (
 from pipeline.progress import ProgressCallback
 from followup.sources import (
     FOLLOWUP_EVIDENCE_ITEM_PROMPT_CHARS,
-    _debug_evidence_candidates,
     _debug_ref_candidates,
-    _faiss_semantic_candidates,
     _is_api_followup_mode,
-    _metadata_candidates,
     _preview_text,  # noqa: F401 - re-exported for existing tests/importers
-    _raw_log_candidates,
-    _vector_store_candidates,
 )
 
 DEFAULT_TOP_K_RESULTS = 10
@@ -40,18 +35,14 @@ FOLLOWUP_LLM_MAX_TOKENS = 4096
 FOLLOWUP_EVIDENCE_BUDGET_CHARS = 40_000
 
 _SOURCE_WEIGHTS = {
-    "faiss": 1.0,
-    "metadata": 0.9,
+    "api_ref": 1.0,
     "raw_log": 0.75,
-    "vector_store": 0.7,
     "debug": 0.65,
 }
 
 _SOURCE_CAPS = {
-    "faiss": 4,
-    "metadata": 4,
+    "api_ref": 8,
     "raw_log": 3,
-    "vector_store": 2,
     "debug": 2,
 }
 
@@ -142,8 +133,8 @@ def _rank_and_select_evidence(
 
     for _, item in scored:
         cap = _SOURCE_CAPS.get(item.source, 2)
-        if broad_summary_mode and item.source in {"faiss", "metadata"}:
-            cap = min(cap, 3)
+        if broad_summary_mode and item.source == "api_ref":
+            cap = min(cap, 6)
         if source_counts.get(item.source, 0) >= cap:
             continue
         if broad_summary_mode and file_counts.get(item.file_name, 0) >= 2:
@@ -248,42 +239,24 @@ def _generate_conversational_answer(
         "notes": intent.notes,
     }
 
-    system_prompt = (
-        "You are an IAM forensic follow-up assistant. "
-        "Provide a direct conversational answer to the user's follow-up. "
-        "For short or broad prompts (for example: other issues, anything else, summarize), "
-        "infer likely intent from current query + chat history + original report context. "
-        "Use only the provided evidence; do not invent facts. "
-        "When evidence is insufficient, explicitly say what is missing."
-    )
-
-    if api_followup_mode:
-        system_prompt += (
-            " In this conversation, cite only real [REF_...] IDs from provided evidence. "
-            "Never invent citation tags such as [METADATA], [RAW_LOG], or [VECTOR_STORE]."
-        )
-
-    citation_instruction = "Respond in concise conversational markdown and cite evidence IDs inline like [M2], [F1]."
-    if api_followup_mode:
-        citation_instruction = (
-            "Respond in concise conversational markdown and cite only actual [REF_...] IDs "
-            "from the provided evidence."
-        )
+    from followup.prompts import build_answer_messages
 
     ticket_block = ""
     if getattr(context, "ticket_text", "") and not api_followup_mode:
         t = context.ticket_text[:1200]
-        ticket_block = f"Support ticket context (excerpt — this analysis was guided by the attached ticket):\n{t}{'...' if len(context.ticket_text) > 1200 else ''}\n\n"
+        ticket_block = (
+            f"Support ticket context (excerpt — this analysis was guided by the attached ticket):\n"
+            f"{t}{'...' if len(context.ticket_text) > 1200 else ''}\n\n"
+        )
 
-    human_prompt = (
-        f"Original analysis query: {context.query_text}\n"
-        f"{ticket_block}"
-        f"Recent chat turns:\n{history_text}\n\n"
-        f"Follow-up query: {query}\n"
-        f"Parsed intent JSON: {json.dumps(intent_payload)}\n\n"
-        "Available evidence:\n"
-        f"{evidence_block}\n\n"
-        f"{citation_instruction}"
+    system_prompt, human_prompt = build_answer_messages(
+        original_query=context.query_text,
+        ticket_block=ticket_block,
+        chat_history=history_text,
+        query=query,
+        intent_payload=intent_payload,
+        evidence_block=evidence_block,
+        api_followup_mode=api_followup_mode,
     )
 
     try:
@@ -306,7 +279,6 @@ def answer_analysis_results_query(
     query: str,
     top_k: int = DEFAULT_TOP_K_RESULTS,
     chat_history: list[dict[str, str]] | None = None,
-    vector_store: Any = None,
     progress_callback: ProgressCallback | None = None,
 ) -> str:
     """
@@ -317,8 +289,6 @@ def answer_analysis_results_query(
         query: Follow-up query text
         top_k: Number of evidence rows to surface
         chat_history: Prior chat turns for conversational context
-        vector_store: Persistent vector store adapter
-
     Returns:
         Conversational markdown answer with compact evidence table
     """
@@ -357,23 +327,7 @@ def answer_analysis_results_query(
 
     terms = _intent_terms(intent, query)
 
-    api_followup_mode = _is_api_followup_mode(context)
-
-    if api_followup_mode:
-        candidates = _debug_ref_candidates(context, terms)
-    else:
-        metadata_items = _metadata_candidates(context)
-        faiss_items = _faiss_semantic_candidates(context, query)
-        debug_items = _debug_evidence_candidates(context, terms)
-        raw_log_items = _raw_log_candidates(context, terms)
-        vector_items = _vector_store_candidates(query, vector_store)
-        candidates = [
-            *faiss_items,
-            *metadata_items,
-            *raw_log_items,
-            *debug_items,
-            *vector_items,
-        ]
+    candidates = _debug_ref_candidates(context, terms)
 
     selected = _rank_and_select_evidence(intent, candidates, top_k)
 

@@ -18,7 +18,7 @@ def test_rank_and_select_evidence():
         must_include=[], confidence=0.8, notes="test",
     )
     candidates = [
-        EvidenceItem(evidence_id="R1", source="faiss", file_name="a.log",
+        EvidenceItem(evidence_id="R1", source="api_ref", file_name="a.log",
                      relevance=1.0, anomaly_score=0.0, excerpt="error A", raw_text="error A"),
         EvidenceItem(evidence_id="R2", source="debug", file_name="b.log",
                      relevance=0.9, anomaly_score=0.0, excerpt="error B", raw_text="error B"),
@@ -31,7 +31,7 @@ def test_evidence_table_separator_matches_header():
     selected = [
         EvidenceItem(
             evidence_id="R1",
-            source="faiss",
+            source="api_ref",
             file_name="a.log",
             relevance=1.0,
             anomaly_score=2.7,

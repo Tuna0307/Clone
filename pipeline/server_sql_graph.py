@@ -41,7 +41,6 @@ from pipeline.server_metrics import (
     load_server_metrics_into_duckdb,
     load_server_metrics_into_duckdb_with_signals,
     normalize_llm_sql,
-    UAM5_SERVER_MONITORING_DICTIONARY_TEXT,
 )
 from pipeline.constants import (
     EVIDENCE_GATHERING_MAX_QUERIES_PER_TURN,
@@ -350,6 +349,20 @@ def broad_diagnostic_and_archetype_classification_node(
 ) -> ServerMonitoringState:
     """Balanced deterministic pre-screening + LLM archetype synthesis."""
     _emit_node_start("broad_diagnostic_and_archetype_classification")
+
+    # Reclassification cap
+    if state.reclassification_count >= 2:
+        print("  [Server][STRUCTURED] Reclassification cap reached — proceeding to synthesis")
+        state.current_phase = "report_synthesis"
+        state.add_trace_step(
+            step=state.steps_taken,
+            phase="broad_diagnostic_and_archetype_classification",
+            node="broad_diagnostic",
+            observations=["Reclassification cap (2) reached — skipping to report_synthesis"],
+            decision="finalize",
+        )
+        return state
+
     if state.reclassification_count > 0 and state.structural_signals:
         state.structural_signals = []
         state.phases_completed.discard("broad_diagnostic_and_archetype_classification")
@@ -363,17 +376,24 @@ def broad_diagnostic_and_archetype_classification_node(
 
     structural: list[dict] = []
     if conn is not None:
-        structural = run_broad_diagnostic_queries(conn)
-        for sig in structural:
-            state.add_structural_signal(sig)
-            state.add_trace_step(
-                step=f"struct-{sig.get('signal_id', '?')}",
-                phase="broad_diagnostic_and_archetype_classification",
-                node="broad_diagnostic",
-                sql_blocks=[sig.get("sql_query", "")],
-                observations=sig.get("observations", [])[:3],
-                decision="continue",
-            )
+        if state.broad_diagnostic_cache:
+            print("  [Server][STRUCTURED] Broad diagnostic cache hit — skipping re-query")
+            structural = state.broad_diagnostic_cache
+            for sig in structural:
+                state.add_structural_signal(sig)
+        else:
+            structural = run_broad_diagnostic_queries(conn)
+            state.broad_diagnostic_cache = structural
+            for sig in structural:
+                state.add_structural_signal(sig)
+                state.add_trace_step(
+                    step=f"struct-{sig.get('signal_id', '?')}",
+                    phase="broad_diagnostic_and_archetype_classification",
+                    node="broad_diagnostic",
+                    sql_blocks=[sig.get("sql_query", "")],
+                    observations=sig.get("observations", [])[:3],
+                    decision="continue",
+                )
 
     pre_scores = score_archetype_candidates(structural, pre_scan)
     fallback = classification_from_prescores(pre_scores, structural)
@@ -912,12 +932,10 @@ def report_synthesis_node(state: ServerMonitoringState) -> ServerMonitoringState
     )
 
     seed = f"File: {state.file_name}\nRows: {state.metric_row_count} metrics / {state.log_event_row_count} events\n\n{evidence}"
+    from pipeline.server_sql.prompts import build_synthesis_user_message
+
     system = build_server_monitoring_system_prompt(seed, state.ticket_text, classification)
-    user = (
-        f"Produce the final 3-section report for {state.file_name} using all collected typed evidence. "
-        "Include the Incident Archetype Assessment subsection with dominant archetype, "
-        "strongest rejected alternative, and why not the other archetype(s)."
-    )
+    user = build_synthesis_user_message(state.file_name)
 
     try:
         resp = llm.invoke([{"role": "system", "content": system}, {"role": "user", "content": user}])
@@ -942,6 +960,76 @@ def report_synthesis_node(state: ServerMonitoringState) -> ServerMonitoringState
     _emit_node_complete("report_synthesis")
     return state
 
+#COMMENTED HERE
+def autonomous_summary_node(state: ServerMonitoringState) -> ServerMonitoringState:
+    state.phases_completed.add("autonomous_summary")
+    summary_lines = []
+
+    # Prefer burst/cardinality signals over latency as primary pattern
+    preferred_signal = None
+    for sig in state.high_volume_signals:
+        if sig.signal_type in ("high_result_count", "authz_loop_candidate", 
+                                "method_burst", "high_volume_cardinality"):
+            preferred_signal = sig
+            break
+    if preferred_signal is None and state.high_volume_signals:
+        preferred_signal = state.high_volume_signals[0]
+
+    if preferred_signal:
+        summary_lines.append(
+            f"**Primary detected pattern:** {preferred_signal.signal_type} "
+            f"(first seen: {preferred_signal.timestamp})"
+        )
+        if preferred_signal.captured_value:
+            summary_lines.append(f"**Peak value:** {preferred_signal.captured_value}")
+        summary_lines.append(f"**Key line:** {preferred_signal.snippet[:200]}")
+
+    # Archetype from classification
+    archetype = getattr(state, "archetype_classification", None)
+    if archetype:
+        primary = archetype.get("primary", {}) if isinstance(archetype, dict) else {}
+        if primary:
+            summary_lines.append(
+                f"**Incident type:** {primary.get('archetype', 'unknown')} "
+                f"(confidence: {primary.get('confidence', 0):.0%})"
+            )
+
+    # Onset — skip ambiguous labels
+    if state.critical_windows:
+        for w in state.critical_windows:
+            label = w.label or ""
+            if "ambiguous" not in label.lower():
+                summary_lines.append(
+                    f"**Incident onset:** {w.start_time} — {w.label}"
+                )
+                break
+
+    # Evidence base
+    summary_lines.append(
+        f"**Evidence base:** {state.queries_executed} SQL queries, "
+        f"{state.log_event_row_count:,} log events, "
+        f"{state.metric_row_count:,} metric snapshots"
+    )
+
+    if summary_lines:
+        autonomous_block = (
+            "\n\n" + "=" * 60 +
+            "\nAUTONOMOUS LOG BEHAVIOR SUMMARY\n"
+            "(Derived from deterministic Phase 0 evidence - "
+            "no ticket required)\n\n" +
+            "\n".join(summary_lines)
+        )
+        state.final_findings = (state.final_findings or "") + autonomous_block
+
+    state.autonomous_summary_generated = True
+    state.add_trace_step(
+        step=state.steps_taken,
+        phase="autonomous_summary",
+        node="autonomous_summary",
+        decision="finalize",
+    )
+    state.current_phase = "finalize"
+    return state
 
 def ticket_refinement_node(state: ServerMonitoringState) -> ServerMonitoringState:
     """Append Ticket-Guided Root Cause Addendum when a ticket was supplied."""
@@ -953,7 +1041,19 @@ def ticket_refinement_node(state: ServerMonitoringState) -> ServerMonitoringStat
         return state
 
     llm = _get_llm(state)
-    prompt = build_ticket_refinement_prompt(state.ticket_text, state.final_findings)
+    # Collect already-gathered observations from trace — no new queries
+    existing_evidence_parts = []
+    for step in state.trace:
+        for obs in (step.observations or []):
+            if obs and len(obs.strip()) > 10:
+                existing_evidence_parts.append(obs.strip())
+    existing_evidence = "\n---\n".join(existing_evidence_parts[-20:])
+    prompt = prompt = build_ticket_refinement_prompt(
+    ticket_text=state.ticket_text,
+    current_findings=state.final_findings,
+    existing_evidence=existing_evidence,
+)
+
 
     try:
         resp = llm.invoke([{"role": "user", "content": prompt}])
@@ -981,6 +1081,9 @@ NODE_REGISTRY: dict[str, NodeFn] = {
     "critic": critic_node,
     "report_synthesis": report_synthesis_node,
     "ticket_refinement": ticket_refinement_node,
+    #COMMENTED HERE
+
+    "autonomous_summary": autonomous_summary_node,
     "finalize": lambda s: s,
 }
 
@@ -992,23 +1095,31 @@ def _should_continue_after_critic(state: ServerMonitoringState) -> str:
     """Conditional edge after critic node."""
     if state.steps_taken >= state.max_steps - 2:
         return "report_synthesis"
+
     last = state.critic_feedback_history[-1] if state.critic_feedback_history else {}
     verdict = last.get("verdict")
-    if verdict == "RECLASSIFY":
+
+    reclassify_count = sum(
+        1 for entry in state.critic_feedback_history
+        if entry.get("verdict") == "RECLASSIFY"
+    )
+
+    if verdict == "RECLASSIFY" and reclassify_count < 1:
+        # Allow one reclassification attempt
         return "broad_diagnostic_and_archetype_classification"
-    if verdict == "FAIL":
-        return "evidence_gathering"
-    if getattr(state, "current_phase", None) == "broad_diagnostic_and_archetype_classification":
-        return "broad_diagnostic_and_archetype_classification"
-    if getattr(state, "current_phase", None) == "evidence_gathering":
-        return "evidence_gathering"
-    return "report_synthesis"
+    elif verdict in ("RECLASSIFY", "FAIL"):
+        # Already reclassified once or evidence gathering failed — move forward
+        return "report_synthesis"
+    else:
+        return "report_synthesis"
+
+
 
 def _should_do_ticket_refinement(state: ServerMonitoringState) -> str:
     """Decide after report_synthesis whether to run the optional ticket-guided refinement pass."""
     if state.ticket_text and state.final_findings:
         return "ticket_refinement"
-    return "finalize"
+    return "autonomous_summary"
 
 def _build_server_monitoring_graph() -> CompiledStateGraph:
     """Build and compile the LangGraph StateGraph for the structured workflow."""
@@ -1029,6 +1140,40 @@ def _build_server_monitoring_graph() -> CompiledStateGraph:
     graph.add_node("report_synthesis", report_synthesis_node)
     graph.add_node("ticket_refinement", ticket_refinement_node)
 
+    #COMMENTED HERE
+    # Add the node
+# Add the node
+    graph.add_node("autonomous_summary", autonomous_summary_node)
+
+    # Update conditional after report_synthesis
+    graph.add_conditional_edges(
+        "report_synthesis",
+        _should_do_ticket_refinement,
+        {
+            "ticket_refinement": "ticket_refinement",
+            "autonomous_summary": "autonomous_summary",
+        },
+    )
+
+    # ticket_refinement flows to autonomous_summary before ending
+    graph.add_edge("ticket_refinement", "autonomous_summary")
+    graph.add_edge("autonomous_summary", END)
+
+    # Update conditional after report_synthesis
+    # graph.add_conditional_edges(
+    #     "report_synthesis",
+    #     _should_do_ticket_refinement,
+    #     {
+    #         "ticket_refinement": "ticket_refinement",
+    #         "autonomous_summary": "autonomous_summary",   # ← was "finalize"
+    #     },
+    # )
+
+    # # ticket_refinement now flows to autonomous_summary before ending
+    # graph.add_edge("ticket_refinement", "autonomous_summary")  # ← was END
+    # graph.add_edge("autonomous_summary", END)
+
+
     graph.add_edge(START, "initialize")
     graph.add_edge("initialize", "broad_diagnostic_and_archetype_classification")
     graph.add_edge("broad_diagnostic_and_archetype_classification", "onset_analysis_and_symptom_discrimination")
@@ -1046,19 +1191,6 @@ def _build_server_monitoring_graph() -> CompiledStateGraph:
         },
     )
 
-    # Ticket refinement is OPTIONAL and only after synthesis.
-    # Use conditional from report_synthesis so we never create a self-loop on ticket_refinement.
-    graph.add_conditional_edges(
-        "report_synthesis",
-        _should_do_ticket_refinement,
-        {
-            "ticket_refinement": "ticket_refinement",
-            "finalize": END,
-        },
-    )
-
-    # After (optional) ticket refinement we always terminate.
-    graph.add_edge("ticket_refinement", END)
 
     compiled = graph.compile()
     return compiled

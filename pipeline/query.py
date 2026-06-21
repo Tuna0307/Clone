@@ -1,4 +1,4 @@
-"""Query utilities for routing, classification, and time-window handling."""
+"""Query utilities for parsing, subcategory hints, and time-window handling."""
 
 import json
 import os
@@ -6,15 +6,9 @@ import re
 from datetime import datetime
 from typing import Any, Callable, Optional
 
-from langchain_core.documents import Document
-from langchain_core.messages import HumanMessage, SystemMessage
-
-from llm_factory import get_llm
 from pipeline.constants import *
 from pipeline.files import stream_file_lines
 from pipeline.parsing import _parse_iso_timestamp, _parse_line, parse_query_datetime
-
-llm = get_llm()
 
 
 def load_search_config(config_path: str = "search_config.json") -> dict:
@@ -33,7 +27,6 @@ def load_search_config(config_path: str = "search_config.json") -> dict:
         "iam_critical_keywords": list(_DEFAULT_IAM_CRITICAL_KEYWORDS),
         "error_keywords": list(_DEFAULT_ERROR_KEYWORDS),
         "noise_patterns": list(_DEFAULT_NOISE_PATTERNS),
-        "category_keywords": dict(_DEFAULT_CATEGORY_KEYWORDS),
         "api_known_error_keywords": list(_DEFAULT_API_KNOWN_ERROR_KEYWORDS),
         "api_request_boundaries": dict(_DEFAULT_API_REQUEST_BOUNDARIES),
     }
@@ -61,8 +54,6 @@ def load_search_config(config_path: str = "search_config.json") -> dict:
                 value = config.get(key)
                 if isinstance(value, list):
                     merged[key] = value
-            if isinstance(config.get("category_keywords"), dict):
-                merged["category_keywords"] = config["category_keywords"]
             if isinstance(config.get("api_request_boundaries"), dict):
                 merged["api_request_boundaries"] = config["api_request_boundaries"]
             return merged
@@ -93,7 +84,6 @@ def load_retrieval_signals(config_path: str = "search_config.json") -> dict:
         'iam_critical_keywords': iam_keywords,
         'error_keywords': error_keywords,
         'noise_patterns': noise_patterns,
-        'category_keywords': config.get('category_keywords', dict(_DEFAULT_CATEGORY_KEYWORDS)),
         'api_known_error_keywords': [
             str(keyword).lower() for keyword in config.get('api_known_error_keywords', []) if str(keyword).strip()
         ],
@@ -128,7 +118,7 @@ def build_query_context(
     end_time: Optional[str] = None,
 ) -> dict[str, Any]:
     """
-    Build structured query context for routing and validation.
+    Build structured query context for time-window validation.
 
     Args:
         query_text: User incident/query text
@@ -184,173 +174,6 @@ def build_query_filter_summary(query_context: Optional[dict[str, Any]]) -> Optio
     if end_raw:
         return f"Log filtered up to {end_raw}."
     return None
-
-
-def _classify_query_category_fallback(query_text: str, category_keywords: dict[str, list[str]]) -> str:
-    """
-    Deterministic category fallback based on keyword overlap.
-
-    Args:
-        query_text: User query text
-        category_keywords: Category keyword map
-
-    Returns:
-        Category label
-    """
-    text = query_text.lower()
-    scores: dict[str, int] = {}
-    for category, keywords in category_keywords.items():
-        scores[category] = sum(1 for keyword in keywords if str(keyword).lower() in text)
-
-    if scores.get('server_monitoring', 0) > scores.get('api_request', 0):
-        return 'server_monitoring'
-    return 'api_request'
-
-
-def _extract_json_payload(text: str) -> Optional[dict[str, Any]]:
-    """
-    Extract first valid JSON object from an LLM response.
-
-    Args:
-        text: Raw model text
-
-    Returns:
-        Parsed JSON object or None
-    """
-    stripped = text.strip()
-    if not stripped:
-        return None
-
-    candidate = stripped
-    if not candidate.startswith('{'):
-        start_idx = candidate.find('{')
-        end_idx = candidate.rfind('}')
-        if start_idx >= 0 and end_idx > start_idx:
-            candidate = candidate[start_idx:end_idx + 1]
-
-    try:
-        payload = json.loads(candidate)
-        if isinstance(payload, dict):
-            return payload
-    except Exception:
-        return None
-
-    return None
-
-
-def _build_category_router_prompt(
-    category_keywords: dict[str, list[str]],
-    api_known_error_keywords: list[str],
-) -> str:
-    """
-    Build a strict routing prompt with category semantics and examples.
-
-    Args:
-        category_keywords: Category keyword map
-        api_known_error_keywords: IAM/API known error signature keywords
-
-    Returns:
-        System prompt for routing
-    """
-    api_kw = ', '.join(str(k) for k in category_keywords.get('api_request', [])[:20])
-    monitor_kw = ', '.join(str(k) for k in category_keywords.get('server_monitoring', [])[:20])
-    known_err_kw = ', '.join(str(k) for k in api_known_error_keywords[:24])
-
-    return (
-        "You are a high-precision query router for IAM incident analysis. "
-        "Classify the user query into exactly one label: api_request or server_monitoring.\n\n"
-        "Category definitions:\n"
-        "- api_request: authentication/authorization/login/logout/session/token/user-activation/user-access/API errors, "
-        "service-to-service auth, crypto/HSM/token verification failures, request/response failures.\n"
-        "- server_monitoring: infrastructure health/performance/resource diagnostics such as CPU, memory, heap, "
-        "GC, latency, throughput, thread-pool saturation, host/server slowdowns/timeouts not tied to API auth failures.\n\n"
-        "Strong routing guidance:\n"
-        "- Any user activation/access/login/token/authentication/authorization failure should route to api_request.\n"
-        "- Prefer api_request for IAM/business-flow failures unless the query is clearly about infrastructure metrics.\n"
-        "- server_monitoring is for system performance/health incidents.\n\n"
-        f"api_request hint keywords: {api_kw}\n"
-        f"server_monitoring hint keywords: {monitor_kw}\n"
-        f"IAM known error signatures: {known_err_kw}\n\n"
-        "Examples:\n"
-        "- 'Failure to activate a user on our platform' -> api_request\n"
-        "- 'Users fail login with token verification error' -> api_request\n"
-        "- 'CPU spikes and GC pauses causing slowness' -> server_monitoring\n"
-        "- 'Thread pool saturation and high latency on server' -> server_monitoring\n\n"
-        "Return JSON only with this schema:\n"
-        "{\"category\": \"api_request|server_monitoring\", \"confidence\": 0.0-1.0, \"reason\": \"short rationale\"}."
-    )
-
-
-def classify_query_category(
-    query_text: str,
-    category_keywords: dict[str, list[str]],
-    api_known_error_keywords: Optional[list[str]] = None,
-) -> tuple[str, float, str, bool]:
-    """
-    Classify the primary category for a query.
-
-    Args:
-        query_text: User query text
-        category_keywords: Category keyword map
-        api_known_error_keywords: Known API/IAM error signature hints
-
-    Returns:
-        Tuple(category, confidence, reason, fallback_used)
-    """
-    stripped = query_text.strip()
-    if not stripped:
-        return 'api_request', 1.0, 'empty query defaults to api_request', True
-
-    known_error_keywords = api_known_error_keywords or []
-    fallback_category = _classify_query_category_fallback(stripped, category_keywords)
-    fallback_reason = 'deterministic keyword fallback'
-
-    system_text = _build_category_router_prompt(category_keywords, known_error_keywords)
-    parser_followup = (
-        "Return JSON only. Do not include markdown, code fences, prose, or additional keys. "
-        "Required keys: category, confidence, reason."
-    )
-
-    for attempt in range(1, ROUTER_MAX_ATTEMPTS + 1):
-        try:
-            user_text = f"Query:\n{stripped}"
-            if attempt > 1:
-                user_text += f"\n\n{parser_followup}"
-
-            response = llm.invoke([
-                SystemMessage(content=system_text),
-                HumanMessage(content=user_text),
-            ])
-            response_text = str(getattr(response, 'content', '')).strip()
-            payload = _extract_json_payload(response_text)
-            if payload is None:
-                print(f"  [Route] Router parse failed on attempt {attempt}.")
-                continue
-
-            category = str(payload.get('category', '')).strip().lower()
-            if category not in {'api_request', 'server_monitoring'}:
-                print(f"  [Route] Router returned invalid category on attempt {attempt}: {category}")
-                continue
-
-            raw_confidence = payload.get('confidence', 0.0)
-            try:
-                confidence = float(raw_confidence)
-            except Exception:
-                confidence = 0.0
-            confidence = max(0.0, min(1.0, confidence))
-
-            reason = str(payload.get('reason', '')).strip() or 'llm router decision'
-            if confidence < ROUTER_MIN_CONFIDENCE:
-                print(
-                    f"  [Route] Low-confidence router output ({confidence:.2f}) -> fallback {fallback_category}"
-                )
-                return fallback_category, confidence, reason, True
-
-            return category, confidence, reason, False
-        except Exception as e:
-            print(f"  [Route] LLM category classification failed on attempt {attempt}: {e}")
-
-    return fallback_category, 0.0, fallback_reason, True
 
 
 def classify_api_subcategory(query_text: str, known_error_keywords: list[str]) -> str:
@@ -422,31 +245,6 @@ def _align_datetime_timezone(value: Optional[datetime], reference: Optional[date
     return value.replace(tzinfo=None)
 
 
-def compute_docs_time_coverage(docs: list[Document]) -> tuple[Optional[datetime], Optional[datetime]]:
-    """
-    Compute min/max timestamps across chunk metadata.
-
-    Args:
-        docs: Document list
-
-    Returns:
-        (min_ts, max_ts)
-    """
-    start_values: list[datetime] = []
-    end_values: list[datetime] = []
-    for doc in docs:
-        start_dt = _parse_iso_timestamp(str(doc.metadata.get('start_time', '')))
-        end_dt = _parse_iso_timestamp(str(doc.metadata.get('end_time', '')))
-        if start_dt is not None:
-            start_values.append(start_dt)
-        if end_dt is not None:
-            end_values.append(end_dt)
-
-    min_ts = min(start_values) if start_values else None
-    max_ts = max(end_values) if end_values else (max(start_values) if start_values else None)
-    return min_ts, max_ts
-
-
 def validate_query_window(
     query_context: Optional[dict[str, Any]],
     min_ts: Optional[datetime],
@@ -514,61 +312,6 @@ def validate_query_window(
         f"Requested time window ({window_start.isoformat()} to {window_end.isoformat()}) "
         f"does not overlap available log timestamps ({min_ts.isoformat()} to {max_ts.isoformat()})."
     )
-
-
-def filter_docs_by_query_window(docs: list[Document], query_context: Optional[dict[str, Any]]) -> list[Document]:
-    """
-    Filter chunk docs to those overlapping the query window.
-
-    Args:
-        docs: Chunk docs
-        query_context: Query context dict
-
-    Returns:
-        Filtered docs
-    """
-    if query_context is None:
-        return docs
-
-    start_time = query_context.get('start_time')
-    end_time = query_context.get('end_time')
-    if start_time is None and end_time is None:
-        return docs
-
-    result: list[Document] = []
-    for doc in docs:
-        doc_start = _parse_iso_timestamp(str(doc.metadata.get('start_time', '')))
-        doc_end = _parse_iso_timestamp(str(doc.metadata.get('end_time', '')))
-
-        if doc_start is None and doc_end is None:
-            # Keep no-timestamp chunks: they cannot be proven outside the
-            # requested window and may still contain critical/error signals.
-            result.append(doc)
-            continue
-
-        reference_ts = doc_start if doc_start is not None else doc_end
-        start_time_aligned = _align_datetime_timezone(start_time, reference_ts)
-        end_time_aligned = _align_datetime_timezone(end_time, reference_ts)
-
-        left = start_time_aligned if start_time_aligned is not None else doc_start
-        right = end_time_aligned if end_time_aligned is not None else doc_end
-
-        if left is None or right is None:
-            result.append(doc)
-            continue
-
-        if doc_start is None:
-            doc_start = doc_end
-        if doc_end is None:
-            doc_end = doc_start
-
-        if doc_start is None or doc_end is None:
-            continue
-
-        overlaps = not (doc_end < left or doc_start > right)
-        if overlaps:
-            result.append(doc)
-    return result
 
 
 def compute_file_time_coverage(file_path: str, schema: dict) -> tuple[Optional[datetime], Optional[datetime]]:

@@ -8,37 +8,17 @@ import re
 
 __all__ = [
     "ANOMALY_HIGH_THRESHOLD",
-    "ANOMALY_K_NEIGHBOURS",
-    "ANOMALY_REF_MAX",
-    "ANOMALY_REF_SAMPLE_RATIO",
     "BENIGN_CHUNK_MAX_CHARS",
-    "CHUNK_OVERLAP_CHARS",
-    "DEDUP_NUMERIC_TOKEN_MIN_LEN",
-    "EMBEDDING_BACKOFF_BASE_SECONDS",
-    "EMBEDDING_CONCURRENCY",
-    "EMBEDDING_MAX_CHARS",
-    "EMBEDDING_MAX_RETRIES",
     "ERROR_CHUNK_MAX_CHARS",
     "ERROR_SCORE_BOOST",
     "IAM_CRITICAL_SCORE_BOOST",
-    "LARGE_LOG_CHUNK_TRIGGER",
     "MAP_EVIDENCE_BUDGET_CHARS",
     "MAP_MAX_CHUNKS",
     "MAP_NEIGHBOUR_RADIUS",
     "MAP_TOP_N_CHUNKS",
-    "MAX_EMBEDDING_CHUNKS_VERY_LARGE",
-    "MAX_GROUP_CHARS",
     "MAX_LOG_FILE_SIZE_BYTES",
-    "NO_TS_CATCH_ALL_CHARS",
     "REDUCE_EVIDENCE_BUDGET_CHARS",
     "REDUCE_PER_FILE_CAP_CHARS",
-    "ROUTER_MAX_ATTEMPTS",
-    "ROUTER_MIN_CONFIDENCE",
-    "SERVER_MONITOR_WINDOW_SECONDS",
-    "SIGNAL_FILTER_MIN_CANDIDATES",
-    "UNGROUPED_MAX_LINES_PER_CHUNK",
-    "UNGROUPED_WINDOW_SECONDS",
-    "VERY_LARGE_LOG_CHUNK_TRIGGER",
     # DuckDB / server_monitoring agentic SQL (new path)
     "SERVER_SQL_MAX_STEPS",
     "SERVER_SQL_MAX_RECLASSIFICATIONS",
@@ -59,12 +39,9 @@ __all__ = [
     "TICKET_REFINEMENT_EXTRA_STEPS",
     "_DEFAULT_API_KNOWN_ERROR_KEYWORDS",
     "_DEFAULT_API_REQUEST_BOUNDARIES",
-    "_DEFAULT_CATEGORY_KEYWORDS",
     "_DEFAULT_ERROR_KEYWORDS",
     "_DEFAULT_IAM_CRITICAL_KEYWORDS",
     "_DEFAULT_NOISE_PATTERNS",
-    "_DEDUP_HEX_ADDR_RE",
-    "_DEDUP_LONG_HEX_RE",
     "_DEDUP_UUID_RE",
     "_DEDUP_WS_RE",
     "_QUERY_DATE_ONLY_FORMATS",
@@ -77,9 +54,7 @@ MAP_EVIDENCE_BUDGET_CHARS: int = 800_000   # Hard cap on evidence chars sent to 
 MAP_TOP_N_CHUNKS: int = 180                 # Top anomaly-scored chunks to select
 MAP_MAX_CHUNKS: int = 450                  # Max total chunks (ranked seeds + neighbours)
 MAP_NEIGHBOUR_RADIUS: int = 2              # Temporal neighbours per selected chunk
-SIGNAL_FILTER_MIN_CANDIDATES: int = 48     # Minimum chunk candidates retained before anomaly scoring
 MAX_LOG_FILE_SIZE_BYTES: int = 5 * 1024 * 1024 * 1024  # 5GB limit per file
-SERVER_MONITOR_WINDOW_SECONDS: int = 300   # 5-minute windows for server monitoring logs
 
 # -- DuckDB server_monitoring agentic SQL path (new opt-in mode) --
 SERVER_SQL_MAX_STEPS: int = 30              # Hard cap on iterative SQL queries / LLM turns before forcing final report.
@@ -139,30 +114,8 @@ BENIGN_CHUNK_MAX_CHARS: int = 2_000        # Max chars for benign/routine chunks
 REDUCE_EVIDENCE_BUDGET_CHARS: int = 600_000  # Hard cap on total compiled evidence
 REDUCE_PER_FILE_CAP_CHARS: int = 60_000       # Max chars per file's findings in reduce
 
-# -- Hybrid chunking --
-MAX_GROUP_CHARS: int = 15_000              # Max chars before splitting a thread group
-CHUNK_OVERLAP_CHARS: int = 500             # Overlap between split thread groups
-NO_TS_CATCH_ALL_CHARS: int = 10_000        # Catch-all chunk size for no-timestamp lines
-UNGROUPED_WINDOW_SECONDS: int = 120        # Time-window size for ungrouped timestamped lines
-UNGROUPED_MAX_LINES_PER_CHUNK: int = 700   # Split oversized ungrouped windows by line count
-
-# -- Pre-embedding compression (Stage 2.5; applies BEFORE anomaly scoring only) --
-LARGE_LOG_CHUNK_TRIGGER: int = 3_000         # Enable conservative pre-embedding compression
-VERY_LARGE_LOG_CHUNK_TRIGGER: int = 12_000   # Enable additional downselection for extreme chunk counts
-MAX_EMBEDDING_CHUNKS_VERY_LARGE: int = 6_000  # Hard cap for chunks sent to embedding in very large mode
-DEDUP_NUMERIC_TOKEN_MIN_LEN: int = 4         # Replace long numeric tokens during canonical dedup normalization
-
-# -- Embedding safety --
-EMBEDDING_MAX_CHARS: int = 16_000          # Provider-safe cap before embedding request tokenization
-EMBEDDING_CONCURRENCY: int = 5             # Parallel embedding workers
-EMBEDDING_MAX_RETRIES: int = 5             # Retry attempts for transient/throttling failures
-EMBEDDING_BACKOFF_BASE_SECONDS: float = 1.5  # Exponential backoff base for embed retries
-
-# -- Anomaly scoring --
-ANOMALY_REF_SAMPLE_RATIO: float = 0.25    # Fraction of chunks sampled as "normal" reference
-ANOMALY_REF_MAX: int = 600                # Max reference set size
-ANOMALY_K_NEIGHBOURS: int = 6             # kNN for distance calculation
-ANOMALY_HIGH_THRESHOLD: float = 2.5       # z-score threshold for "high-anomaly"
+# -- Deterministic API scoring / follow-up ranking --
+ANOMALY_HIGH_THRESHOLD: float = 2.5       # Score threshold for high-signal evidence
 ERROR_SCORE_BOOST: float = 2.0            # Score boost for error-bearing chunks
 IAM_CRITICAL_SCORE_BOOST: float = 4.0     # Extra boost for IAM-domain-critical chunks (stacks on ERROR_SCORE_BOOST)
 
@@ -217,17 +170,6 @@ _DEFAULT_NOISE_PATTERNS: list[str] = [
     r'hql:\s*select\b',
 ]
 
-_DEFAULT_CATEGORY_KEYWORDS: dict[str, list[str]] = {
-    'api_request': [
-        'api', 'request', 'response', 'endpoint', 'xmlrpc',
-        'login', 'logout', 'authorize', 'token', 'auth', 'saml',
-    ],
-    'server_monitoring': [
-        'cpu', 'memory', 'heap', 'thread pool', 'latency', 'throughput',
-        'gc', 'jvm', 'slow', 'timeout', 'resource', 'server',
-    ],
-}
-
 _DEFAULT_API_KNOWN_ERROR_KEYWORDS: list[str] = [
     'tokenexception',
     'authenticationexception',
@@ -249,18 +191,11 @@ _DEFAULT_API_REQUEST_BOUNDARIES: dict[str, list[str]] = {
     'end_markers': [' - exit', ':exit', ' exit,', 'lapse(ms)='],
 }
 
-# Conservative normalization patterns used for exact/canonical dedup only
-# (accuracy-first: avoid aggressive semantic collapsing)
 _DEDUP_UUID_RE = re.compile(
     r'\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}\b'
 )
-_DEDUP_HEX_ADDR_RE = re.compile(r'\b0x[0-9a-fA-F]+\b')
-_DEDUP_LONG_HEX_RE = re.compile(r'\b[0-9a-fA-F]{12,}\b')
 _DEDUP_WS_RE = re.compile(r'\s+')
 _STACK_TRACE_LINE_RE = re.compile(r'^\s*(?:at\s+|\.\.\.\s+\d+\s+more\b)')
-
-ROUTER_MIN_CONFIDENCE: float = 0.60
-ROUTER_MAX_ATTEMPTS: int = 2
 
 _QUERY_DATETIME_FORMATS: list[str] = [
     '%Y-%m-%d %H:%M:%S.%f',

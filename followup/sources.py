@@ -1,21 +1,4 @@
-"""Source-candidate extraction helpers for artifact-first follow-up retrieval.
-
-This module holds the 12 evidence-source functions extracted from
-`followup_retrieval.py` so that the retrieval orchestration layer stays thin:
-
-- parse_debug_evidence_file
-- _is_api_followup_mode
-- _extract_ref_ids
-- _debug_ref_candidates
-- build_analysis_results_debug_markdown
-- _metadata_candidates
-- _faiss_semantic_candidates
-- _split_candidate_snippets
-- _debug_evidence_candidates
-- _extract_raw_log_windows
-- _raw_log_candidates
-- _vector_store_candidates
-"""
+"""Source-candidate extraction helpers for artifact-first follow-up retrieval."""
 
 from __future__ import annotations
 
@@ -24,51 +7,23 @@ import re
 from collections import deque
 from typing import Any
 
-import numpy as np
+from followup.context import AnalysisContext, EvidenceItem
 
-from followup.context import AnalysisContext, EvidenceItem, _as_float, _load_metadata_rows
-from followup.intent import _get_followup_embeddings
-
-try:
-    import faiss
-except Exception:  # pragma: no cover - optional runtime dependency
-    faiss = None  # type: ignore[assignment]
-
-# Constants only used by source functions
 FOLLOWUP_EVIDENCE_PREVIEW_CHARS = 320
 FOLLOWUP_RAW_LOG_MAX_SNIPPETS_PER_FILE = 3
 FOLLOWUP_RAW_LOG_MAX_LINES_PER_SNIPPET = 7
-FOLLOWUP_DEBUG_MAX_CHARS = 6000
-FOLLOWUP_FAISS_TOP_K = 10
 FOLLOWUP_EVIDENCE_ITEM_PROMPT_CHARS = 900
 
 _REF_ID_RE = re.compile(r"\[(REF_[^\]]+)\]")
 
 
 def _preview_text(text: str, max_chars: int = FOLLOWUP_EVIDENCE_PREVIEW_CHARS) -> str:
-    """
-    Build one-line preview.
-
-    Args:
-        text: Input text
-        max_chars: Preview cap
-
-    Returns:
-        Preview text
-    """
+    """Build one-line preview."""
     return text.replace("\n", " ")[:max_chars]
 
 
 def parse_debug_evidence_file(file_path: str) -> dict[str, str]:
-    """
-    Parse debug evidence text into sections.
-
-    Args:
-        file_path: Debug evidence path
-
-    Returns:
-        Dict with system_prompt, user_prompt, and raw text
-    """
+    """Parse debug evidence text into sections."""
     if not os.path.exists(file_path):
         return {"error": f"Debug evidence file not found: {file_path}"}
 
@@ -101,28 +56,12 @@ def parse_debug_evidence_file(file_path: str) -> dict[str, str]:
 
 
 def _is_api_followup_mode(context: AnalysisContext) -> bool:
-    """
-    Determine whether follow-up should enforce API REF-only citation behavior.
-
-    Args:
-        context: Active analysis context
-
-    Returns:
-        True when any entry belongs to API request category
-    """
+    """True when any entry belongs to API request category."""
     return any(entry.category == "api_request" for entry in context.entries)
 
 
 def _extract_ref_ids(text: str) -> list[str]:
-    """
-    Extract REF IDs from evidence text.
-
-    Args:
-        text: Input text block
-
-    Returns:
-        Ordered list of unique REF IDs
-    """
+    """Extract ordered unique REF IDs from evidence text."""
     seen: set[str] = set()
     ids: list[str] = []
     for match in _REF_ID_RE.findall(text):
@@ -135,16 +74,7 @@ def _extract_ref_ids(text: str) -> list[str]:
 
 
 def _debug_ref_candidates(context: AnalysisContext, terms: list[str]) -> list[EvidenceItem]:
-    """
-    Build REF-grounded evidence candidates from debug evidence prompts.
-
-    Args:
-        context: Active context
-        terms: Query/intent terms
-
-    Returns:
-        Evidence items with evidence_id set to real REF IDs
-    """
+    """Build REF-grounded evidence candidates from debug evidence prompts."""
     items: list[EvidenceItem] = []
     lowered_terms = [term.lower() for term in terms if term.strip()]
 
@@ -195,16 +125,7 @@ def _debug_ref_candidates(context: AnalysisContext, terms: list[str]) -> list[Ev
 
 
 def build_analysis_results_debug_markdown(context: AnalysisContext, max_chars: int = 7000) -> str:
-    """
-    Build markdown summary for debug evidence files.
-
-    Args:
-        context: Analysis context
-        max_chars: Truncation cap for rendering safety
-
-    Returns:
-        Markdown string
-    """
+    """Build markdown summary for debug evidence files."""
     if not context.entries:
         return "No analysis context available for debug evidence."
 
@@ -239,235 +160,6 @@ def build_analysis_results_debug_markdown(context: AnalysisContext, max_chars: i
     return "\n".join(lines)
 
 
-def _metadata_candidates(context: AnalysisContext) -> list[EvidenceItem]:
-    """
-    Convert metadata rows into evidence candidates.
-
-    Args:
-        context: Active context
-
-    Returns:
-        Metadata evidence items
-    """
-    items: list[EvidenceItem] = []
-    counter = 1
-
-    for entry in context.entries:
-        rows = _load_metadata_rows(entry)
-        for row in rows:
-            content = str(row.get("content", "")).strip()
-            if not content:
-                continue
-
-            anomaly = _as_float(row.get("anomaly_score", 0.0))
-            iam_critical = bool(row.get("iam_critical", False))
-            relevance = 0.45 + min(max(anomaly, 0.0), 8.0) / 12.0
-            if iam_critical:
-                relevance += 0.2
-
-            key = str(row.get("primary_key", "")).strip()
-            start = str(row.get("start_time", "")).strip()
-            end = str(row.get("end_time", "")).strip()
-
-            item_text = (
-                f"file={entry.file_name} primary_key={key or 'n/a'} "
-                f"anomaly_score={anomaly:.3f} time={start or 'n/a'} -> {end or 'n/a'}\n"
-                f"{content}"
-            )
-            items.append(
-                EvidenceItem(
-                    evidence_id=f"M{counter}",
-                    source="metadata",
-                    file_name=entry.file_name,
-                    relevance=min(relevance, 1.0),
-                    anomaly_score=anomaly,
-                    excerpt=_preview_text(item_text),
-                    raw_text=item_text,
-                )
-            )
-            counter += 1
-
-    return items
-
-
-def _faiss_semantic_candidates(context: AnalysisContext, query: str) -> list[EvidenceItem]:
-    """
-    Query persisted FAISS indexes to retrieve semantically close chunks.
-
-    Args:
-        context: Active context
-        query: User follow-up query
-
-    Returns:
-        FAISS evidence items
-    """
-    if faiss is None or np is None:
-        return []
-
-    embeddings = _get_followup_embeddings()
-    if embeddings is None:
-        return []
-
-    try:
-        query_vector = embeddings.embed_query(query)
-    except Exception:
-        return []
-
-    if not query_vector:
-        return []
-
-    query_matrix = np.array([query_vector], dtype="float32")
-    items: list[EvidenceItem] = []
-    counter = 1
-
-    for entry in context.entries:
-        index_path = os.path.join(entry.faiss_index_dir, "index.faiss")
-        if not os.path.exists(index_path):
-            continue
-
-        rows = _load_metadata_rows(entry)
-        if not rows:
-            continue
-
-        try:
-            index = faiss.read_index(index_path)
-            k_value = min(FOLLOWUP_FAISS_TOP_K, len(rows))
-            distances, indices = index.search(query_matrix, k_value)
-        except Exception:
-            continue
-
-        if len(indices) == 0:
-            continue
-
-        for rank, row_index in enumerate(indices[0]):
-            if row_index < 0 or row_index >= len(rows):
-                continue
-            row = rows[int(row_index)]
-            distance = float(distances[0][rank]) if len(distances) else 999.0
-            anomaly = _as_float(row.get("anomaly_score", 0.0))
-            relevance = 1.0 / (1.0 + max(distance, 0.0))
-            content = str(row.get("content", "")).strip()
-            key = str(row.get("primary_key", "")).strip()
-            if not content:
-                continue
-
-            item_text = (
-                f"file={entry.file_name} distance={distance:.4f} "
-                f"primary_key={key or 'n/a'} anomaly_score={anomaly:.3f}\n"
-                f"{content}"
-            )
-            items.append(
-                EvidenceItem(
-                    evidence_id=f"F{counter}",
-                    source="faiss",
-                    file_name=entry.file_name,
-                    relevance=min(max(relevance, 0.0), 1.0),
-                    anomaly_score=anomaly,
-                    excerpt=_preview_text(item_text),
-                    raw_text=item_text,
-                )
-            )
-            counter += 1
-
-    return items
-
-
-def _split_candidate_snippets(text: str, terms: list[str], max_snippets: int = 2) -> list[tuple[float, str]]:
-    """
-    Build relevance-scored snippets from a large text blob.
-
-    Args:
-        text: Source text
-        terms: Query terms
-        max_snippets: Maximum snippets to return
-
-    Returns:
-        List of tuples (score, snippet)
-    """
-    if not text.strip():
-        return []
-
-    paragraphs = [block.strip() for block in re.split(r"\n\s*\n", text) if block.strip()]
-    if not paragraphs:
-        paragraphs = [text.strip()]
-
-    scored: list[tuple[float, str]] = []
-    lowered_terms = [term.lower() for term in terms if term.strip()]
-
-    for paragraph in paragraphs:
-        paragraph_lower = paragraph.lower()
-        score = 0.2
-        for term in lowered_terms:
-            score += paragraph_lower.count(term) * 0.25
-        scored.append((score, paragraph[:FOLLOWUP_DEBUG_MAX_CHARS]))
-
-    scored.sort(key=lambda item: item[0], reverse=True)
-    return scored[:max_snippets]
-
-
-def _debug_evidence_candidates(context: AnalysisContext, terms: list[str]) -> list[EvidenceItem]:
-    """
-    Retrieve relevant snippets from debug evidence files.
-
-    Args:
-        context: Active context
-        terms: Query/intent terms
-
-    Returns:
-        Debug evidence items
-    """
-    items: list[EvidenceItem] = []
-    counter = 1
-
-    for entry in context.entries:
-        parsed = parse_debug_evidence_file(entry.debug_evidence_file)
-        if "error" in parsed:
-            continue
-
-        merged_text = (
-            f"System Prompt:\n{parsed.get('system_prompt', '')[:FOLLOWUP_DEBUG_MAX_CHARS]}\n\n"
-            f"User Prompt and Evidence:\n{parsed.get('user_prompt', '')[:FOLLOWUP_DEBUG_MAX_CHARS]}"
-        )
-        for relevance, snippet in _split_candidate_snippets(merged_text, terms, max_snippets=2):
-            item_text = f"[DEBUG] file={entry.file_name}\n{snippet}"
-            items.append(
-                EvidenceItem(
-                    evidence_id=f"D{counter}",
-                    source="debug",
-                    file_name=entry.file_name,
-                    relevance=min(max(relevance, 0.0), 1.0),
-                    anomaly_score=0.0,
-                    excerpt=_preview_text(item_text),
-                    raw_text=item_text,
-                )
-            )
-            counter += 1
-
-    return items
-
-
-def _extract_raw_log_windows(lines: list[str], hit_indexes: list[int]) -> list[str]:
-    """
-    Build contextual windows around matching line indexes.
-
-    Args:
-        lines: Full file lines
-        hit_indexes: Matched line indexes
-
-    Returns:
-        Context windows
-    """
-    windows: list[str] = []
-    for line_index in hit_indexes[:FOLLOWUP_RAW_LOG_MAX_SNIPPETS_PER_FILE]:
-        start = max(0, line_index - 2)
-        end = min(len(lines), line_index + 3)
-        snippet_lines = []
-        for cursor in range(start, end):
-            snippet_lines.append(f"L{cursor + 1}: {lines[cursor].rstrip()}")
-        windows.append("\n".join(snippet_lines[:FOLLOWUP_RAW_LOG_MAX_LINES_PER_SNIPPET]))
-    return windows
-
-
 def _format_numbered_window(numbered_lines: list[tuple[int, str]]) -> str:
     return "\n".join(
         f"L{line_number}: {line.rstrip()}"
@@ -476,16 +168,7 @@ def _format_numbered_window(numbered_lines: list[tuple[int, str]]) -> str:
 
 
 def _stream_raw_log_windows(file_handle: Any, lowered_terms: list[str]) -> list[str]:
-    """
-    Build raw-log snippets without loading the full source file into memory.
-
-    Args:
-        file_handle: Iterable text file handle
-        lowered_terms: Lowercase search terms
-
-    Returns:
-        Context windows around hits, or bounded first/last fallback windows
-    """
+    """Build raw-log snippets without loading the full source file into memory."""
     windows: list[str] = []
     before: deque[tuple[int, str]] = deque(maxlen=2)
     pending: list[dict[str, Any]] = []
@@ -541,16 +224,7 @@ def _stream_raw_log_windows(file_handle: Any, lowered_terms: list[str]) -> list[
 
 
 def _raw_log_candidates(context: AnalysisContext, terms: list[str]) -> list[EvidenceItem]:
-    """
-    Retrieve relevant snippets from source logs (remaining raw content).
-
-    Args:
-        context: Active context
-        terms: Query/intent terms
-
-    Returns:
-        Raw-log evidence items
-    """
+    """Retrieve relevant snippets from source logs."""
     items: list[EvidenceItem] = []
     counter = 1
     lowered_terms = [term.lower() for term in terms if term.strip()]
@@ -584,51 +258,5 @@ def _raw_log_candidates(context: AnalysisContext, terms: list[str]) -> list[Evid
                 )
             )
             counter += 1
-
-    return items
-
-
-def _vector_store_candidates(
-    query: str,
-    vector_store: Any,
-) -> list[EvidenceItem]:
-    """
-    Retrieve semantically similar historical context from persistent vector store.
-
-    Args:
-        query: User follow-up query
-        vector_store: ChatVectorStore instance
-
-    Returns:
-        Vector store evidence items
-    """
-    if vector_store is None:
-        return []
-
-    try:
-        docs = vector_store.retrieve_context(query, k=3)
-    except Exception:
-        return []
-
-    items: list[EvidenceItem] = []
-    for index, doc in enumerate(docs, start=1):
-        content = str(getattr(doc, "page_content", "")).strip()
-        metadata = getattr(doc, "metadata", {}) or {}
-        file_name = str(metadata.get("log_path", metadata.get("analysis_id", "historical_context")))
-        if not content:
-            continue
-
-        item_text = content
-        items.append(
-            EvidenceItem(
-                evidence_id=f"V{index}",
-                source="vector_store",
-                file_name=file_name,
-                relevance=0.55,
-                anomaly_score=0.0,
-                excerpt=_preview_text(item_text),
-                raw_text=item_text[:2000],
-            )
-        )
 
     return items

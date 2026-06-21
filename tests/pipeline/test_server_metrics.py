@@ -7,6 +7,8 @@ import pytest
 import pandas as pd
 
 from pipeline.server_metrics import (
+    LOG_EVENTS_CREATE_SQL,
+    SERVER_METRICS_CREATE_SQL,
     format_duckdb_observation_bounds,
     format_query_dataframe,
     get_duckdb_observation_bounds,
@@ -138,6 +140,62 @@ def test_copy_from_path_produces_correct_counts():
             assert null_ts_cnt == 1, f"Expected 1 NULL timestamp row, got {null_ts_cnt}"
 
             # Verify CSV escaping preserved commas and quotes in raw_line
+            escaped_row = conn.execute(
+                "SELECT raw_line FROM log_events WHERE raw_line LIKE '%select * from users%'"
+            ).fetchone()
+            assert escaped_row is not None
+            assert 'select * from users, items' in escaped_row[0]
+            assert 'count=5' in escaped_row[0]
+        finally:
+            conn.close()
+
+
+def test_appender_path_produces_correct_counts():
+    """Verify that DuckDB Appender ingestion produces correct row counts (functional equivalence)."""
+    lines = [
+        # 5 metric-bearing lines (6 numeric metrics total; am.serverName is string and skipped)
+        "2024-01-15 09:00:00.000 [main] INFO Server statistics={am.serverName=SRV1, jvm.freeMemory=1000000}",
+        "2024-01-15 09:00:01.000 [main] INFO Server statistics={dbcp.ActiveConnections=5, dbcp.AllConnections=10}",
+        "2024-01-15 09:00:02.000 [main] INFO Server statistics={hibernate.sessionCount=3}",
+        "2024-01-15 09:00:03.000 [main] INFO msg={eventManager.threadPoolActiveCount=2}",
+        "2024-01-15 09:00:04.000 [main] INFO Server statistics={am.tomcat.thread.current.count=50}",
+        # 5 non-metric lines
+        "2024-01-15 09:00:05.000 [main] ERROR at com.foo.Bar.method(Bar.java:123)",
+        "2024-01-15 09:00:06.000 [main] INFO Health check OK",
+        "2024-01-15 09:00:07.000 [main] WARN something happened",
+        "2024-01-15 09:00:08.000 [main] INFO routine heartbeat",
+        "2024-01-15 09:00:09.000 [main] DEBUG trace message",
+        # 1 line with no timestamp
+        "no timestamp here at all",
+        # 1 signal line
+        "2024-01-15 09:00:10.000 [main] INFO Count = 6891 rows returned",
+        # CSV escaping line with commas and quotes
+        '2024-01-15 09:00:11.000 [main] INFO query="select * from users, items", count=5',
+    ]
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path = os.path.join(tmpdir, "server.log")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+
+        schema = _make_schema()
+        db_file = os.path.join(tmpdir, "test.duckdb")
+        conn = load_server_metrics_into_duckdb(path, schema, db_path=db_file)
+        try:
+            log_cnt = conn.execute("SELECT COUNT(*) FROM log_events").fetchone()[0]
+            metric_cnt = conn.execute("SELECT COUNT(*) FROM server_metrics").fetchone()[0]
+
+            # 12 timestamped lines + 1 no-timestamp line = 13 total in log_events
+            assert log_cnt == 13, f"Expected 13 log_events rows, got {log_cnt}"
+            # am.serverName=SRV1 is non-numeric and skipped by _extract_metric_pairs
+            assert metric_cnt == 6, f"Expected 6 server_metrics rows, got {metric_cnt}"
+
+            # Verify the no-timestamp line was inserted with NULL timestamp
+            null_ts_cnt = conn.execute(
+                "SELECT COUNT(*) FROM log_events WHERE timestamp IS NULL"
+            ).fetchone()[0]
+            assert null_ts_cnt == 1, f"Expected 1 NULL timestamp row, got {null_ts_cnt}"
+
+            # Verify commas and quotes are preserved in raw_line via Appender
             escaped_row = conn.execute(
                 "SELECT raw_line FROM log_events WHERE raw_line LIKE '%select * from users%'"
             ).fetchone()
@@ -335,6 +393,80 @@ def test_server_metrics_wide_view_created_on_load():
             conn.close()
 
 
+def test_flag_columns_populated_after_load():
+    """Pre-computed categorical flags and extracted values must be present in log_events."""
+    lines = [
+        "2024-01-15 09:00:00.000 [main] INFO Server statistics={jvm.freeMemory=1000000}",
+        "2024-01-15 09:00:01.000 [main] INFO Count = 6891 rows returned for listMyRequests",
+        "2024-01-15 09:00:02.000 [main] ERROR RoleValidator - entry repeated 50 times",
+        "2024-01-15 09:00:03.000 [main] INFO lapse(ms)=124517 on LDAP findByFilter",
+        "2024-01-15 09:00:04.000 [main] INFO REST:authn/login lapse(ms)=550",
+        "2024-01-15 09:00:05.000 [main] INFO scheduled createIndexAllAvailableCredentialTO lapse(ms)=52000",
+        "2024-01-15 09:00:06.000 [main] INFO at com.foo.Bar.method(Bar.java:123)",
+    ]
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path = os.path.join(tmpdir, "server.log")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+
+        schema = _make_schema()
+        conn = load_server_metrics_into_duckdb(path, schema, db_path=os.path.join(tmpdir, "test.duckdb"))
+        try:
+            # Boolean flags
+            latency_cnt = conn.execute(
+                "SELECT COUNT(*) FROM log_events WHERE has_latency = TRUE"
+            ).fetchone()[0]
+            assert latency_cnt == 3, f"Expected 3 has_latency rows, got {latency_cnt}"
+
+            count_cnt = conn.execute(
+                "SELECT COUNT(*) FROM log_events WHERE has_count_rows = TRUE"
+            ).fetchone()[0]
+            assert count_cnt == 1, f"Expected 1 has_count_rows row, got {count_cnt}"
+
+            entry_cnt = conn.execute(
+                "SELECT COUNT(*) FROM log_events WHERE has_entry_authz = TRUE"
+            ).fetchone()[0]
+            assert entry_cnt == 1, f"Expected 1 has_entry_authz row, got {entry_cnt}"
+
+            ldap_cnt = conn.execute(
+                "SELECT COUNT(*) FROM log_events WHERE has_ldap = TRUE"
+            ).fetchone()[0]
+            assert ldap_cnt == 1, f"Expected 1 has_ldap row, got {ldap_cnt}"
+
+            rest_cnt = conn.execute(
+                "SELECT COUNT(*) FROM log_events WHERE has_rest = TRUE"
+            ).fetchone()[0]
+            assert rest_cnt == 1, f"Expected 1 has_rest row, got {rest_cnt}"
+
+            sched_cnt = conn.execute(
+                "SELECT COUNT(*) FROM log_events WHERE has_scheduled = TRUE"
+            ).fetchone()[0]
+            assert sched_cnt == 1, f"Expected 1 has_scheduled row, got {sched_cnt}"
+
+            # Extracted values
+            lat_row = conn.execute(
+                "SELECT latency_ms FROM log_events WHERE has_latency = TRUE ORDER BY latency_ms DESC"
+            ).fetchone()
+            assert lat_row[0] == 124517, f"Expected latency_ms=124517, got {lat_row[0]}"
+
+            count_row = conn.execute(
+                "SELECT result_count FROM log_events WHERE has_count_rows = TRUE"
+            ).fetchone()
+            assert count_row[0] == 6891, f"Expected result_count=6891, got {count_row[0]}"
+
+            sig_row = conn.execute(
+                "SELECT method_sig FROM log_events WHERE method_sig IS NOT NULL"
+            ).fetchone()
+            assert "Bar.java:123" in sig_row[0], f"Expected method_sig with Bar.java:123, got {sig_row[0]}"
+
+            op_row = conn.execute(
+                "SELECT scheduled_op_name FROM log_events WHERE has_scheduled = TRUE"
+            ).fetchone()
+            assert "createIndexAllAvailableCredentialTO" in op_row[0], f"Expected scheduled_op_name, got {op_row[0]}"
+        finally:
+            conn.close()
+
+
 def test_normalize_llm_sql_rewrites_wide_metric_queries():
     sql = """
     SELECT ts, thread_count, tomcat_busy_threads
@@ -423,3 +555,83 @@ def test_normalize_llm_sql_executes_evidence_gathering_style_query():
             assert any("lapse(ms)=97550" in str(row["raw_line"]) for _, row in log_rows.iterrows())
         finally:
             conn.close()
+
+
+def test_gated_flags_skip_regex_on_benign_lines():
+    """Benign lines without signal keywords must leave gated extracted columns NULL/False."""
+    from pipeline.server_metrics import _compute_log_event_flags
+
+    benign_lines = [
+        "2024-01-15 09:00:00.000 [main] INFO Server statistics={am.serverName=SRV1}",
+        "2024-01-15 09:00:02.000 [main] INFO Health check OK",
+        "2024-01-15 09:00:03.000 [main] WARN something happened",
+        "2024-01-15 09:00:04.000 [main] INFO nothing special here",
+        "2024-01-15 09:00:05.000 [main] DEBUG trace message",
+    ]
+    for line in benign_lines:
+        flags = _compute_log_event_flags(line)
+        assert flags["method_sig"] is None
+        assert flags["latency_ms"] is None
+        assert flags["result_count"] is None
+        assert flags["scheduled_op_name"] is None
+
+
+def test_ingest_log_chunk_produces_expected_rows():
+    """_ingest_log_chunk should return the same rows as the old inline loop."""
+    from pipeline.server_metrics import _ingest_log_chunk
+
+    lines = [
+        "2024-01-15 09:00:00.000 [main] INFO Server statistics={am.serverName=SRV1, jvm.freeMemory=1000000}",
+        "2024-01-15 09:00:01.000 [main] INFO Count = 6891 rows returned for listMyRequests",
+        "2024-01-15 09:00:02.000 [main] ERROR RoleValidator - entry repeated 50 times",
+        "2024-01-15 09:00:03.000 [main] INFO lapse(ms)=124517 on LDAP findByFilter",
+        "2024-01-15 09:00:04.000 [main] INFO Healthy heartbeat",
+        "2024-01-15 09:00:05.000 [main] INFO Server statistics={dbcp.ActiveConnections=5}",
+    ]
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path = os.path.join(tmpdir, "server.log")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+
+        schema = _make_schema()
+        log_rows, metric_rows, signals = _ingest_log_chunk(
+            path, schema, start_offset=0, end_offset=None,
+        )
+        assert len(log_rows) == 6, f"Expected 6 log rows, got {len(log_rows)}"
+        assert len(metric_rows) == 2, f"Expected 2 metric rows, got {len(metric_rows)}"
+        assert len(signals) == 0, f"Expected 0 signals (collect_signals=False), got {len(signals)}"
+
+        # Verify flags are present in log_rows
+        row = log_rows[1]  # Count = 6891 line
+        assert row[10] is True, "has_count_rows should be True"
+        assert row[16] == 6891, "result_count should be 6891"
+
+
+def test_parallel_ingestion_produces_same_counts_as_serial():
+    """ProcessPoolExecutor path must match single-threaded counts exactly."""
+    lines = [
+        "2024-01-15 09:00:00.000 [main] INFO Server statistics={am.serverName=SRV1, jvm.freeMemory=1000000}",
+        "2024-01-15 09:00:01.000 [main] INFO Count = 6891 rows returned for listMyRequests",
+        "2024-01-15 09:00:02.000 [main] ERROR RoleValidator - entry repeated 50 times",
+        "2024-01-15 09:00:03.000 [main] INFO lapse(ms)=124517 on LDAP findByFilter",
+        "2024-01-15 09:00:04.000 [main] INFO Healthy heartbeat",
+        "2024-01-15 09:00:05.000 [main] INFO Server statistics={dbcp.ActiveConnections=5}",
+    ]
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path = os.path.join(tmpdir, "server.log")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+
+        schema = _make_schema()
+        conn = duckdb.connect(os.path.join(tmpdir, "parallel.duckdb"))
+        conn.execute(LOG_EVENTS_CREATE_SQL)
+        conn.execute(SERVER_METRICS_CREATE_SQL)
+
+        from pipeline.server_metrics import _ingest_parallel
+        _ingest_parallel(path, schema, conn, max_workers=2)
+
+        log_cnt = conn.execute("SELECT COUNT(*) FROM log_events").fetchone()[0]
+        metric_cnt = conn.execute("SELECT COUNT(*) FROM server_metrics").fetchone()[0]
+        assert log_cnt == 6, f"Expected 6 log_events, got {log_cnt}"
+        assert metric_cnt == 2, f"Expected 2 metric rows, got {metric_cnt}"
+        conn.close()

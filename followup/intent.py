@@ -10,11 +10,10 @@ from typing import Any, Optional
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from config import LLM_MAX_TOKENS, LLM_MODEL_ID, LLM_TEMPERATURE
-from llm_factory import get_llm, get_embeddings
+from llm_factory import get_llm
 from followup.context import AnalysisContext, FollowupIntent, _as_float
 
 _FOLLOWUP_LLM = None
-_FOLLOWUP_EMBEDDINGS = None
 
 FOLLOWUP_INTENT_MIN_CONFIDENCE = 0.45
 FOLLOWUP_CHAT_HISTORY_TURNS = 10
@@ -66,22 +65,6 @@ def _get_followup_llm():
     if _FOLLOWUP_LLM is None:
         _FOLLOWUP_LLM = get_llm()
     return _FOLLOWUP_LLM
-
-
-def _get_followup_embeddings():
-    """
-    Lazily initialize embeddings client for FAISS semantic lookups.
-
-    Returns:
-        Configured embedding client or None if unavailable
-    """
-    global _FOLLOWUP_EMBEDDINGS
-    if _FOLLOWUP_EMBEDDINGS is None:
-        try:
-            _FOLLOWUP_EMBEDDINGS = get_embeddings()
-        except Exception:
-            return None
-    return _FOLLOWUP_EMBEDDINGS
 
 
 def _extract_first_json_object(text: str) -> Optional[dict[str, Any]]:
@@ -219,26 +202,13 @@ def _parse_intent(
     history_text = _format_chat_history(chat_history)
     fallback_intent = _fallback_intent_from_query(query, chat_history)
 
-    system_prompt = (
-        "You are an IAM log analysis follow-up intent parser. "
-        "Read the current query and recent chat history, then output ONLY one JSON object. "
-        "No markdown, no code block, no prose."
-    )
+    from followup.prompts import build_intent_messages
 
-    human_prompt = (
-        "Return JSON with this exact schema:\n"
-        "{\n"
-        '  "ask_type": "root_cause|timeline|errors|anomalies|thread|summary|evidence|other",\n'
-        '  "entities": ["..."],\n'
-        '  "primary_keys": ["..."],\n'
-        '  "must_include": ["..."],\n'
-        '  "confidence": 0.0,\n'
-        '  "notes": "short reason"\n'
-        "}\n\n"
-        f"Original analysis query: {context.query_text[:1200]}\n"
-        f"Analysis report excerpt: {context.report_text[:FOLLOWUP_REPORT_SNIPPET_CHARS]}\n"
-        f"Recent chat history:\n{history_text}\n\n"
-        f"Current user follow-up query: {query}"
+    system_prompt, human_prompt = build_intent_messages(
+        original_query=context.query_text,
+        report_excerpt=context.report_text,
+        chat_history=history_text,
+        query=query,
     )
 
     try:

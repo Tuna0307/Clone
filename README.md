@@ -4,14 +4,14 @@
 
 The IAM Log Intelligence Agent analyzes Identity and Access Management (IAM) logs and produces evidence-grounded forensic reports. The current application runs through Streamlit (`app.py`) and uses `iam_log_intelligence_agent_hybridChunking2.py` as the active analysis pipeline.
 
-The code supports both OpenAI and AWS Bedrock through `llm_factory.py`, with the active provider configured in `.env`. Analysis artifacts are written under `outputs/` so generated debug evidence, FAISS indexes, uploaded files, and PDF reports do not clutter the repository root.
+The code supports both OpenAI and AWS Bedrock through `llm_factory.py`, with the active provider configured in `.env`. Analysis artifacts are written under `outputs/` so generated debug evidence, uploaded files, and PDF reports do not clutter the repository root.
 
 The system is designed for:
 
 - Large log sets: a Map-Reduce pipeline processes files one at a time.
 - Mixed log formats: schema detection identifies timestamps, threads, session keys, and stack-trace continuations.
 - Request lifecycle analysis: API/request logs can be extracted deterministically without embedding every line.
-- Server monitoring analysis: infrastructure-style logs can use either the legacy chunking/embedding/anomaly path or the opt-in DuckDB + agentic SQL path (recommended for UAM resource logs).
+- Server monitoring analysis: UAM infrastructure/resource logs use the opt-in DuckDB + structured SQL workflow (`--mode server_monitoring`).
 - Evidence traceability: final reports replace internal chunk IDs with original file names and precise line references where possible.
 
 ## Key Features
@@ -20,32 +20,30 @@ The system is designed for:
 | :--- | :--- |
 | Streamlit UI | Upload one or more log files, or analyze a local file/folder path. |
 | Date/time controls | Optional calendar and time pickers validate incident windows without manual timestamp typing. |
-| Category routing | The pipeline routes work into API request analysis or server monitoring analysis based on query and log signals. |
+| Analysis mode selection | Choose API request or server monitoring analysis via the UI radio or CLI `--mode`. |
 | Deterministic API extraction | Request/event spans are built from thread, boundary markers, timestamps, and IAM-critical signals. |
-| Hybrid chunking | Server monitoring logs are grouped by thread/session first, then by time windows, then catch-all chunks. |
-| Pre-embedding compression | Large logs use conservative canonical deduplication before expensive embedding work. |
-| Anomaly scoring | Server monitoring chunks use embedding distance, z-scores, IAM/error boosts, and noise suppression. |
+| Server monitoring SQL workflow | UAM server statistics logs use DuckDB + explicit-phase LangGraph analysis. |
+| Deterministic API scoring | API request evidence uses IAM/error/boundary boosts without embeddings. |
 | Strict citations | Reports cite original log file names and line numbers, including precise error-line references inside larger chunks. |
 | Follow-up chat | After analysis, follow-up questions reuse stored artifacts instead of rerunning the pipeline by default. |
-| Organized artifacts | Debug evidence, FAISS indexes, uploads, and reports are stored in `outputs/`. |
+| Organized artifacts | Debug evidence, uploads, and reports are stored in `outputs/`. |
 
 ## Active Files
 
 | File | Purpose |
 | :--- | :--- |
 | `app.py` | Streamlit chat UI, file upload/local path input, incident time controls, and follow-up panels. |
-| `iam_log_intelligence_agent_hybridChunking2.py` | Active analysis pipeline used by the app and CLI. |
+| `iam_log_intelligence_agent_hybridChunking2.py` | Thin CLI shim re-exporting `run_pipeline` and `build_query_context`. |
+| `pipeline/` | Modular Map-Reduce implementation (api_request + server_monitoring paths). |
 | `llm_factory.py` | Provider factory for OpenAI or Bedrock chat models and embeddings. |
 | `config.py` | Central environment configuration and credential validation. |
-| `artifact_paths.py` | Central output paths for debug files, FAISS artifacts, reports, and uploads. |
+| `artifact_paths.py` | Central output paths for debug files, reports, and uploads. |
 | `followup_retrieval.py` | Artifact-first retrieval for follow-up questions after an analysis run. |
-| `chat_vector_store.py` | Session-only Chroma vector store for report-level follow-up context. |
 | `upload_utils.py` | Safe persistence for Streamlit-uploaded log files. |
 | `ui_time_utils.py` | Small UI helper for formatting optional date/time inputs. |
 | `schema.py` | Optional schema inference helpers used when regex schema detection is low-confidence. |
-| `search_config.json` | Configurable IAM keywords, API request boundaries, routing terms, and retrieval buckets. |
-| `iam_log_intelligence_agent_hybridChunking.py` | Older hybrid pipeline retained for reference. |
-| `iam_log_intelligence_agent.py` | Legacy v1 agent using generic text splitting and tool-calling. |
+| `search_config.json` | Configurable IAM keywords, API request boundaries, and retrieval buckets. |
+
 
 ## Installation
 
@@ -169,8 +167,7 @@ Most domain tuning belongs in `search_config.json`, not in Python code:
 
 - `iam_critical_keywords`: domain terms that should be boosted during evidence selection.
 - `api_request_boundaries`: start/end markers for deterministic request extraction.
-- `route_categories`: routing hints for API request versus server monitoring analysis.
-- `buckets`: retrieval buckets for targeted evidence collection.
+- `api_known_error_keywords`: known IAM/API error signatures for API-path subcategory hints.
 
 Model/provider settings belong in `.env` and are loaded by `config.py`.
 

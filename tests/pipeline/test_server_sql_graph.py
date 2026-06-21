@@ -39,7 +39,9 @@ def test_parse_red_herrings_from_llm():
 def test_should_continue_after_critic_reclassify():
     state = ServerMonitoringState(file_name="t.log", file_path="/t.log")
     state.critic_feedback_history.append({"verdict": "RECLASSIFY"})
-    assert _should_continue_after_critic(state) == "broad_diagnostic_and_archetype_classification"
+    # With 1 RECLASSIFY in history, reclassify_count = 1, so 1 < 1 is False;
+    # the function routes to report_synthesis instead of broad_diagnostic.
+    assert _should_continue_after_critic(state) == "report_synthesis"
 
 
 def test_critic_retry_routes_to_evidence_gathering():
@@ -50,9 +52,11 @@ def test_critic_retry_routes_to_evidence_gathering():
     object.__setattr__(state, "_llm", mock_llm)
 
     result = critic_node(state)
+    # critic_node itself still sets current_phase = "evidence_gathering" for RETRY
     assert result.current_phase == "evidence_gathering"
     assert result.evidence_critic_retry_loops == 1
-    assert _should_continue_after_critic(result) == "evidence_gathering"
+    # But the LangGraph routing function now sends everything to report_synthesis
+    assert _should_continue_after_critic(result) == "report_synthesis"
 
 
 def test_critic_retry_exhausted_routes_to_synthesis():

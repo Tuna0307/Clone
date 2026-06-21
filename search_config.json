@@ -45,35 +45,6 @@
     "\\[Fatal Error\\].*Element type",
     "hql:\\s*select\\b"
   ],
-  "category_keywords": {
-    "api_request": [
-      "api",
-      "request",
-      "response",
-      "endpoint",
-      "xmlrpc",
-      "login",
-      "logout",
-      "authorize",
-      "token",
-      "auth",
-      "saml"
-    ],
-    "server_monitoring": [
-      "cpu",
-      "memory",
-      "heap",
-      "thread pool",
-      "latency",
-      "throughput",
-      "gc",
-      "jvm",
-      "slow",
-      "timeout",
-      "resource",
-      "server"
-    ]
-  },
   "api_known_error_keywords": [
     "tokenexception",
     "authenticationexception",

@@ -34,6 +34,36 @@ def test_replace_chunk_refs_with_original_references():
     assert "Path:" not in result
 
 
+def test_strip_ref_markers():
+    text = (
+        "High latency in server.log [REF_1][REF_2] during 15:52.\n"
+        "\n"
+        "No verified pool exhaustion [REF_8]."
+    )
+    result = r._strip_ref_markers(text)
+    assert "REF_" not in result
+    assert "High latency in server.log during 15:52." in result
+    assert "No verified pool exhaustion." in result
+    assert "\n\n" in result
+
+
+def test_normalize_ranked_cause_spacing():
+    text = (
+        "Cause 1 (Strongest Evidence): Mixed stall. Supporting Evidence: server.log. "
+        "Confidence: High. Why not higher: Missing telemetry. "
+        "Cause 2: Thread contention. Supporting Evidence: jvm.threadCount high. "
+        "Confidence: Moderate. Why not higher: No dumps. "
+        "Cause 3: DB pressure. Confidence: Low."
+    )
+    result = r._format_server_monitoring_reduce_report(text)
+    assert "Mixed stall." in result
+    assert "\nSupporting Evidence:" in result
+    assert "\n\nCause 2:" in result
+    assert "\n\nCause 3:" in result
+    assert "\nConfidence:" in result
+    assert "\nWhy not higher:" in result
+
+
 def test_format_original_reference_hides_path_behind_icon():
     ref = {
         "source_file": "a.log",

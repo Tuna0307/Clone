@@ -282,6 +282,12 @@ class ServerMonitoringState(BaseModel):
     _duckdb_conn: Any = PrivateAttr(default=None)
     _schema: dict[str, Any] = PrivateAttr(default_factory=dict)
 
+    broad_diagnostic_cache: list[dict] = Field(default_factory=list)
+
+    #To track whether the autonomous summary was generated
+    autonomous_summary_generated: bool = Field(default=False)
+
+
     # ------------------------------------------------------------------
     # model_post_init + helpers (auto-trace + safe private attr handling)
     # ------------------------------------------------------------------

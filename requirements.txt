@@ -8,18 +8,12 @@ python-dotenv>=1.0.0
 # LangChain Ecosystem
 langchain==1.2.12
 langchain-core==1.2.18
-langchain-community==0.4.1
-langchain-chroma==1.1.0
 langchain-aws==1.4.0
 langchain-text-splitters==1.1.0
 
 # OpenAI provider (optional - set LLM_PROVIDER=openai to use)
 langchain-openai>=0.3.0
 openai>=1.50.0
-
-# Vector Store
-faiss-cpu==1.13.2
-chromadb>=0.5.23
 
 # Numerical
 numpy>=1.24.0

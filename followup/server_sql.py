@@ -267,11 +267,9 @@ def _run_followup_sql_loop(
 
         if not sql_blocks:
             if _is_delegating_to_user(text) or re.search(r"(?is)\b(with|select)\b", text):
-                prior_observations.append(
-                    "SYSTEM: SQL was not executed. Emit read-only queries only inside "
-                    "```sql fenced blocks. The system runs SQL automatically — never ask "
-                    "the user to run queries."
-                )
+                from followup.prompts import build_server_followup_sql_retry_nudge
+
+                prior_observations.append(build_server_followup_sql_retry_nudge())
                 continue
             final_answer = text.strip() or (
                 "I could not gather enough SQL evidence to answer that follow-up."

@@ -51,19 +51,47 @@ def format_file_size(size_bytes: int) -> str:
     return f"{size_bytes:.1f} TB"
 
 
-def stream_file_lines(file_path: str) -> Iterator[str]:
+def stream_file_lines(
+    file_path: str,
+    start_offset: int = 0,
+    end_offset: int | None = None,
+) -> Iterator[str]:
     """
     Generator that yields lines from a file one at a time.
     Memory-efficient for extremely large files.
 
     Args:
         file_path: Absolute path to the file
+        start_offset: Byte offset to begin reading from. If > 0, any partial
+            line crossing the boundary is discarded so workers start on a clean
+            line. When the boundary aligns exactly with a line start, no line
+            is discarded.
+        end_offset: Exclusive byte offset to stop reading at. Once the file
+            position exceeds this value, iteration stops.
 
     Yields:
         Individual lines (with newline chars)
     """
-    with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
-        for line in f:
+    with open(file_path, 'r', encoding='utf-8', errors='replace', newline='') as f:
+        if start_offset > 0:
+            f.seek(start_offset)
+            # Determine whether we are exactly at a line boundary.
+            # If the byte before start_offset is a newline (or start_offset
+            # is 0), the next line belongs to this slice; otherwise we are
+            # in the middle of a line and must skip to the next boundary.
+            if start_offset > 0:
+                f.seek(start_offset - 1)
+                prev_char = f.read(1)
+                if prev_char == '\n':
+                    f.seek(start_offset)
+                else:
+                    f.readline()  # discard partial line
+        while True:
+            line = f.readline()
+            if not line:
+                break
+            if end_offset is not None and f.tell() > end_offset:
+                break
             yield line
 
 

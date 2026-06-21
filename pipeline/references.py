@@ -262,3 +262,45 @@ def _replace_chunk_refs_with_original_references(report_text: str, all_findings:
             output_lines.extend(_format_original_reference_markdown(ref))
 
     return '\n'.join(output_lines).strip() + '\n'
+
+
+def _strip_ref_markers(report_text: str) -> str:
+    """
+    Remove internal [REF_...] markers from audience-facing text.
+
+    Used when the reduce step must not emit chunk IDs (e.g. server_monitoring).
+    """
+    citation_re = re.compile(r'\s*\[(REF_[^\]]+)\]')
+    cleaned_lines: list[str] = []
+    for raw_line in report_text.splitlines():
+        if not raw_line.strip():
+            cleaned_lines.append('')
+            continue
+        cleaned = citation_re.sub('', raw_line)
+        cleaned = re.sub(r'\s+([,.;:])', r'\1', cleaned)
+        cleaned = re.sub(r'\s{2,}', ' ', cleaned).strip()
+        cleaned_lines.append(cleaned)
+    return '\n'.join(cleaned_lines).strip() + '\n'
+
+
+_CAUSE_HEADING_RE = re.compile(
+    r'(\*\*Cause [23](?: \(if supported\))?(?: \(Strongest Evidence\))?\*\*:?|Cause [23]:)',
+)
+_CAUSE_FIELD_RE = re.compile(
+    r'(\*\*(?:Supporting Evidence|Confidence|Why not higher)\*\*:|'
+    r'(?:Supporting Evidence|Confidence|Why not higher):)',
+)
+
+
+def _normalize_ranked_cause_spacing(report_text: str) -> str:
+    """Restore blank-line separation between ranked cause blocks and fields."""
+    text = report_text
+    text = _CAUSE_FIELD_RE.sub(r'\n\1', text)
+    text = _CAUSE_HEADING_RE.sub(r'\n\n\1', text)
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    return text.strip() + '\n'
+
+
+def _format_server_monitoring_reduce_report(report_text: str) -> str:
+    """Post-process server_monitoring reduce output for citation and layout cleanup."""
+    return _normalize_ranked_cause_spacing(_strip_ref_markers(report_text))

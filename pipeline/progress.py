@@ -45,8 +45,7 @@ def format_progress_details_block(lines: list[str], *, summary_label: str = "Pip
     if not lines:
         return ""
 
-    step_count = len(lines)
-    label = f"{summary_label} ({step_count} step{'s' if step_count != 1 else ''})"
+    label = summary_label
     body = html.escape("\n".join(lines))
     return (
         f'<details class="pipeline-progress-details">'

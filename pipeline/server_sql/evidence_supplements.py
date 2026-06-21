@@ -51,8 +51,8 @@ def build_evidence_supplement_queries(
                 f"""
                 SELECT timestamp, raw_line
                 FROM {SERVER_LOG_EVENTS_TABLE}
-                WHERE raw_line LIKE '%lapse(ms)%'
-                ORDER BY TRY_CAST(regexp_extract(raw_line, 'lapse\\(ms\\)=(\\d+)', 1) AS BIGINT) DESC NULLS LAST
+                WHERE has_latency = TRUE
+                ORDER BY latency_ms DESC NULLS LAST
                 LIMIT 10
                 """,
             ),
@@ -61,11 +61,11 @@ def build_evidence_supplement_queries(
                 f"""
                 SELECT timestamp, raw_line
                 FROM {SERVER_LOG_EVENTS_TABLE}
-                WHERE raw_line ILIKE '%jdbc%'
-                   OR raw_line ILIKE '%ldap%'
-                   OR raw_line ILIKE '%hibernate%'
-                   OR raw_line ILIKE '%connection%wait%'
-                   OR raw_line ILIKE '%staleobject%'
+                WHERE has_jdbc = TRUE
+                   OR has_ldap = TRUE
+                   OR has_hibernate = TRUE
+                   OR has_connection_wait = TRUE
+                   OR has_staleobject = TRUE
                 ORDER BY timestamp
                 LIMIT 15
                 """,
@@ -98,8 +98,8 @@ def build_evidence_supplement_queries(
             FROM {SERVER_LOG_EVENTS_TABLE}
             WHERE timestamp BETWEEN TIMESTAMP '{lit}' - INTERVAL 3 MINUTE
                                 AND TIMESTAMP '{lit}' + INTERVAL 10 MINUTE
-              AND (raw_line LIKE '%lapse(ms)%' OR raw_line LIKE '%REST:%')
-            ORDER BY TRY_CAST(regexp_extract(raw_line, 'lapse\\(ms\\)=(\\d+)', 1) AS BIGINT) DESC NULLS LAST
+              AND (has_latency = TRUE OR has_rest = TRUE)
+            ORDER BY latency_ms DESC NULLS LAST
             LIMIT 10
             """,
         ),
@@ -111,12 +111,12 @@ def build_evidence_supplement_queries(
             WHERE timestamp BETWEEN TIMESTAMP '{lit}' - INTERVAL 3 MINUTE
                                 AND TIMESTAMP '{lit}' + INTERVAL 10 MINUTE
               AND (
-                raw_line ILIKE '%jdbc%'
-                OR raw_line ILIKE '%ldap%'
-                OR raw_line ILIKE '%hibernate%'
-                OR raw_line ILIKE '%connection%wait%'
-                OR raw_line ILIKE '%staleobject%'
-                OR raw_line ILIKE '%sql%'
+                has_jdbc = TRUE
+                OR has_ldap = TRUE
+                OR has_hibernate = TRUE
+                OR has_connection_wait = TRUE
+                OR has_staleobject = TRUE
+                OR has_sql = TRUE
               )
             ORDER BY timestamp
             LIMIT 15

@@ -47,7 +47,6 @@ def mock_llm(monkeypatch):
 
     # Patch production LLM module-level references if the modules exist.
     for mod_name, attr in [
-        ("iam_log_intelligence_agent_hybridChunking2", "llm"),
         ("followup_retrieval", "_FOLLOWUP_LLM"),
         ("pipeline.query", "llm"),
         ("pipeline.analysis", "llm"),
@@ -93,11 +92,9 @@ def mock_embeddings(monkeypatch):
 
     # Patch production embeddings module-level references if the modules exist.
     for mod_name, attr in [
-        ("iam_log_intelligence_agent_hybridChunking2", "embeddings"),
         ("followup_retrieval", "_FOLLOWUP_EMBEDDINGS"),
         ("pipeline.query", "embeddings"),
         ("pipeline.analysis", "embeddings"),
-        ("pipeline.scoring", "embeddings"),
         ("followup.intent", "_FOLLOWUP_EMBEDDINGS"),
         ("followup.answer", "_FOLLOWUP_EMBEDDINGS"),
     ]:

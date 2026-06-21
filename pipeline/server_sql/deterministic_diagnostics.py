@@ -174,14 +174,16 @@ def detect_endpoint_breadth(conn: Any) -> dict[str, Any] | None:
         SELECT MIN(timestamp) AS t_min, MAX(timestamp) AS t_max FROM {SERVER_LOG_EVENTS_TABLE}
     ),
     early AS (
-        SELECT COUNT(DISTINCT regexp_extract(raw_line, '([A-Za-z0-9_\\.]+(?:\\.java)?:\\d+)', 1)) AS sig_count
+        SELECT COUNT(DISTINCT method_sig) AS sig_count
         FROM {SERVER_LOG_EVENTS_TABLE}, bounds
         WHERE timestamp <= bounds.t_min + (bounds.t_max - bounds.t_min) / 3
+          AND method_sig IS NOT NULL
     ),
     late AS (
-        SELECT COUNT(DISTINCT regexp_extract(raw_line, '([A-Za-z0-9_\\.]+(?:\\.java)?:\\d+)', 1)) AS sig_count
+        SELECT COUNT(DISTINCT method_sig) AS sig_count
         FROM {SERVER_LOG_EVENTS_TABLE}, bounds
         WHERE timestamp >= bounds.t_min + 2 * (bounds.t_max - bounds.t_min) / 3
+          AND method_sig IS NOT NULL
     )
     SELECT early.sig_count AS early_signatures, late.sig_count AS late_signatures
     FROM early, late
@@ -219,8 +221,8 @@ def detect_high_volume_indicators(conn: Any) -> list[dict[str, Any]]:
 
     count_sql = (
         f"SELECT timestamp, raw_line FROM {SERVER_LOG_EVENTS_TABLE} "
-        "WHERE raw_line LIKE '%Count%' OR raw_line LIKE '%rows%' OR raw_line LIKE '%returned%' "
-        "ORDER BY regexp_extract(raw_line, '(\\d{3,})', 1) DESC NULLS LAST LIMIT 5"
+        "WHERE has_count_rows = TRUE "
+        "ORDER BY result_count DESC NULLS LAST LIMIT 5"
     )
     count_rows = _run_query(conn, count_sql)
     if count_rows:
@@ -237,11 +239,11 @@ def detect_high_volume_indicators(conn: Any) -> list[dict[str, Any]]:
     burst_sql = (
         f"WITH bursts AS ("
         f"  SELECT timestamp, "
-        f"         regexp_extract(raw_line, '([A-Za-z0-9_\\.]+(?:\\.java)?:\\d+)', 1) as signature, "
-        f"         COUNT(*) OVER (PARTITION BY regexp_extract(raw_line, '([A-Za-z0-9_\\.]+(?:\\.java)?:\\d+)', 1) "
+        f"         method_sig AS signature, "
+        f"         COUNT(*) OVER (PARTITION BY method_sig "
         f"                        ORDER BY timestamp RANGE BETWEEN INTERVAL 30 SECOND PRECEDING AND CURRENT ROW) as burst "
         f"  FROM {SERVER_LOG_EVENTS_TABLE} "
-        f"  WHERE raw_line LIKE '% - entry%' OR raw_line LIKE '%RoleValidator%' OR raw_line LIKE '%getCredential%'"
+        f"  WHERE has_entry_authz = TRUE AND method_sig IS NOT NULL"
         f") "
         f"SELECT timestamp, signature, burst FROM bursts WHERE burst > 5 ORDER BY burst DESC, timestamp LIMIT 10"
     )
@@ -414,13 +416,13 @@ def detect_recurring_operations(conn: Any) -> list[dict[str, Any]]:
     sql = f"""
     WITH sigs AS (
         SELECT time_bucket(INTERVAL 1 HOUR, timestamp) AS hour_bucket,
-               regexp_extract(raw_line, '([A-Za-z0-9_]+(?:TO|Job|Index|Task)[A-Za-z0-9_]*)', 1) AS operation,
+               scheduled_op_name AS operation,
                COUNT(*) AS occurrences,
                AVG(LENGTH(raw_line)) AS avg_line_len
         FROM {SERVER_LOG_EVENTS_TABLE}
-        WHERE raw_line IS NOT NULL
+        WHERE has_scheduled = TRUE AND scheduled_op_name IS NOT NULL
         GROUP BY hour_bucket, operation
-        HAVING occurrences >= 2 AND operation IS NOT NULL AND operation != ''
+        HAVING occurrences >= 2 AND operation != ''
     )
     SELECT operation, COUNT(DISTINCT hour_bucket) AS hours_seen,
            AVG(occurrences) AS avg_occurrences, STDDEV(occurrences) AS std_occurrences

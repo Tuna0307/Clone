@@ -44,21 +44,20 @@ EMBEDDING_MODEL_ID=amazon.titan-embed-text-v2:0
 | File | Purpose |
 | :--- | :--- |
 | `app.py` | Streamlit UI for uploads, local paths, incident windows, reports, and follow-up chat. |
-| `iam_log_intelligence_agent_hybridChunking2.py` | Current production pipeline. Target active development here. |
-| `iam_log_intelligence_agent_hybridChunking.py` | Older hybrid pipeline retained for comparison/reference. |
-| `iam_log_intelligence_agent.py` | Legacy v1 agent that uses generic text splitting and tool-calling. |
+| `iam_log_intelligence_agent_hybridChunking2.py` | Thin CLI shim (`run_pipeline`, `build_query_context`). |
+| `pipeline/` | Modular Map-Reduce implementation — primary development target. |
 | `llm_factory.py` | Provider factory for OpenAI and Bedrock chat/embedding clients. |
 | `config.py` | Central environment-variable configuration and credential validation. |
 | `artifact_paths.py` | Centralized output paths under `outputs/`. |
 | `followup_retrieval.py` | Artifact-first retrieval for post-analysis follow-up questions. |
-| `chat_vector_store.py` | Session-only vector store for report-level chat context. |
+
 | `upload_utils.py` | Safe handling for Streamlit-uploaded log files. |
 | `ui_time_utils.py` | UI date/time formatting helper. |
 | `schema.py` | Optional schema inference helpers used when regex detection is low-confidence. |
-| `search_config.json` | Routing terms, IAM keywords, request boundaries, and retrieval buckets. |
+| `search_config.json` | IAM keywords, request boundaries, and retrieval buckets. |
 | `requirements.txt` | Pinned Python dependencies. |
 
-Active development should target `iam_log_intelligence_agent_hybridChunking2.py` and the Streamlit flow in `app.py`.
+Active development should target `pipeline/` modules and the Streamlit flow in `app.py`.
 
 ## 3. Testing and Verification
 
@@ -70,10 +69,10 @@ streamlit run app.py --server.fileWatcherType none
 
 Use the UI to upload one or more `.log`, `.txt`, `.out`, `.err`, or `.msg` files. Confirm that:
 
-1. The run prints `[MAP]`, routing, evidence, and `[REDUCE]` phases.
+1. The run prints `[MAP]`, `[Mode]`, evidence, and `[REDUCE]` phases.
 2. The report is rendered in the chat response.
 3. `outputs/reports/IAM_Forensic_Report.pdf` is created.
-4. Debug and FAISS artifacts are grouped under `outputs/debug/` and `outputs/faiss/`.
+4. Debug artifacts are grouped under `outputs/debug/`.
 
 ### CLI smoke test
 
@@ -124,11 +123,11 @@ The current pipeline processes each file in a staged Map-Reduce flow:
 | :--- | :--- | :--- |
 | 1 | `get_log_files_from_path` | Discover valid log files recursively or accept a single file. |
 | 2 | `detect_log_structure` | Detect timestamps, thread IDs, session keys, and stack traces. |
-| 2b | `extract_api_request_docs_deterministic` or chunking path | Route into API/request extraction or server monitoring chunking. |
-| 2.5 | Large-log compression | Deduplicate and downselect very large server-monitoring chunk sets before embedding. |
-| 3 | `score_anomalies` | Embed server-monitoring candidates and compute distance-based anomaly scores. |
-| 4 | `select_evidence_chunks` | Merge ranked evidence, neighbours, citations, and budget limits. |
-| 5 | `analyze_single_file` | Per-file map LLM analysis. |
+| 2b (api_request) | `extract_api_request_docs_deterministic` | Deterministic API request/event extraction. |
+| 2b (server_monitoring) | `analyze_server_log_with_workflow` | DuckDB load + structured SQL workflow. |
+| 3 | `extract_global_evidence_profile` | File-wide deterministic profile (api_request only). |
+| 4 | `select_evidence_chunks` | Merge ranked evidence, neighbours, citations, and budget limits (api_request only). |
+| 5 | `analyze_single_file` | Per-file map LLM analysis (api_request) or SQL workflow output (server_monitoring). |
 | 6 | `consolidate_reports` | Cross-file reduce synthesis and final report text. |
 
 Do not reorder these stages without updating the process diagram, README, and tests.

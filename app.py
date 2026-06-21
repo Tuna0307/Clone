@@ -18,7 +18,7 @@ from datetime import date, time
 import streamlit as st
 
 from artifact_paths import upload_session_dir
-from chat_vector_store import ChatVectorStore
+
 from followup.server_sql import close_server_monitoring_connections, load_temp_duckdb_into_session
 from followup_retrieval import (
     answer_analysis_results_query,
@@ -106,9 +106,6 @@ st.markdown(
 
 if "messages" not in st.session_state:
     st.session_state.messages = []
-
-if "vector_store" not in st.session_state:
-    st.session_state.vector_store = ChatVectorStore()
 
 if "analysis_context" not in st.session_state:
     st.session_state.analysis_context = None
@@ -204,27 +201,28 @@ with st.sidebar:
         if "ticket_text" not in st.session_state:
             st.session_state.ticket_text = None
 
-    st.divider()
-    st.header("Analysis Results")
-    active_context = st.session_state.analysis_context
-    is_api_context = bool(
-        active_context is not None
-        and any(getattr(entry, "category", "") == "api_request" for entry in active_context.entries)
-    )
-    if active_context is None:
-        st.caption("No completed analysis context yet.")
-    else:
-        st.caption(
-            "Active context loaded from latest analysis. "
-            "Follow-up prompts use artifacts and do not rerun pipeline by default."
+    if mode_value != "server_monitoring":
+        st.divider()
+        st.header("Analysis Results")
+        active_context = st.session_state.analysis_context
+        is_api_context = bool(
+            active_context is not None
+            and any(getattr(entry, "category", "") == "api_request" for entry in active_context.entries)
         )
-        view_button_label = "View Retrieved Rows" if is_api_context else "View Retrieved Chunks"
-        if st.button(view_button_label):
-            st.session_state.pending_ui_command = "/show metadata"
-        if st.button("View Coverage Summary"):
-            st.session_state.pending_ui_command = "/show coverage"
+        if active_context is None:
+            st.caption("No completed analysis context yet.")
+        else:
+            st.caption(
+                "Active context loaded from latest analysis. "
+                "Follow-up prompts use artifacts and do not rerun pipeline by default."
+            )
+            view_button_label = "View Retrieved Rows" if is_api_context else "View Retrieved Chunks"
+            if st.button(view_button_label):
+                st.session_state.pending_ui_command = "/show metadata"
+            if st.button("View Coverage Summary"):
+                st.session_state.pending_ui_command = "/show coverage"
 
-st.caption("Use the chat box to submit incident queries. The app validates time windows and routes analysis by category.")
+st.caption("Use the chat box to submit incident queries. The app validates time windows and runs analysis using the selected Analysis Mode.")
 
 
 _REFERENCE_LINE_RE = re.compile(
@@ -703,7 +701,12 @@ if pending_command:
 
 if st.session_state.show_coverage_summary:
     context = st.session_state.analysis_context
-    if context is not None:
+    is_server_only_context = (
+        context is not None
+        and context.entries
+        and all(getattr(e, "category", "") == "server_monitoring" for e in context.entries)
+    )
+    if context is not None and not is_server_only_context:
         coverage_data = build_coverage_summary_table_data(context)
         file_rows = coverage_data.get("files", [])
         bucket_rows = coverage_data.get("buckets", [])
@@ -732,7 +735,12 @@ if st.session_state.show_coverage_summary:
 
 if st.session_state.show_retrieved_chunks:
     context = st.session_state.analysis_context
-    if context is not None:
+    is_server_only_context = (
+        context is not None
+        and context.entries
+        and all(getattr(e, "category", "") == "server_monitoring" for e in context.entries)
+    )
+    if context is not None and not is_server_only_context:
         is_api_context = any(getattr(entry, "category", "") == "api_request" for entry in context.entries)
         panel_data = build_retrieved_chunks_table_data(context, reduce_only=is_api_context)
         rows = panel_data.get("rows", [])
@@ -847,7 +855,6 @@ if user_query:
                     context=context,
                     query=stripped_query,
                     chat_history=st.session_state.messages,
-                    vector_store=st.session_state.vector_store,
                 ),
                 summary_label="Follow-up SQL progress",
                 render_final=True,
@@ -864,7 +871,6 @@ if user_query:
                 context=context,
                 query=stripped_query,
                 chat_history=st.session_state.messages,
-                vector_store=st.session_state.vector_store,
             )
             _push_assistant_message(followup_answer)
     else:
@@ -926,15 +932,6 @@ if user_query:
                         _push_assistant_message(warning_text)
                     elif status == "ok":
                         result = str(pipeline_result.get("report", ""))
-                        st.session_state.vector_store.add_report(
-                            query_text=effective_query,
-                            report_text=result,
-                            metadata={
-                                "log_path": analysis_scope_label.strip(),
-                                "start_time": start_time_text,
-                                "end_time": end_time_text,
-                            },
-                        )
                         per_file_reports = pipeline_result.get("per_file_reports", [])
                         try:
                             effective_ticket = st.session_state.get("ticket_text") if mode_value == "server_monitoring" else None
@@ -979,13 +976,4 @@ if user_query:
                         _push_assistant_message(error_text)
                 else:
                     result = str(pipeline_result)
-                    st.session_state.vector_store.add_report(
-                        query_text=effective_query,
-                        report_text=result,
-                        metadata={
-                            "log_path": analysis_scope_label.strip(),
-                            "start_time": start_time_text,
-                            "end_time": end_time_text,
-                        },
-                    )
                     _push_assistant_message(result)

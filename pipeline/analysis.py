@@ -6,42 +6,20 @@ import os
 import re
 from typing import Any, Optional
 
-import numpy as np
-from langchain_core.documents import Document
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from langchain_core.messages import HumanMessage, SystemMessage
 
-from pipeline.chunking import (
-    chunk_server_monitoring_log,
-    extract_api_request_docs_deterministic,
-)
+from pipeline.chunking import extract_api_request_docs_deterministic
 from pipeline.constants import (
     ANOMALY_HIGH_THRESHOLD,
-    LARGE_LOG_CHUNK_TRIGGER,
     MAP_EVIDENCE_BUDGET_CHARS,
     MAP_NEIGHBOUR_RADIUS,
     MAP_TOP_N_CHUNKS,
-    MAX_EMBEDDING_CHUNKS_VERY_LARGE,
     MAX_LOG_FILE_SIZE_BYTES,
-    SERVER_LOG_EVENTS_TABLE,
-    SERVER_SQL_MAX_STEPS,
-    SERVER_SQL_RESULT_TRUNCATE,
-    TICKET_CONTEXT_MAX_CHARS,
-    TICKET_REFINEMENT_EXTRA_STEPS,
-    VERY_LARGE_LOG_CHUNK_TRIGGER,
     _DEFAULT_API_REQUEST_BOUNDARIES,
-)
-from pipeline.server_metrics import (
-    is_safe_select,
-    load_server_metrics_into_duckdb,
-    pre_detect_high_signal_events,
-    UAM5_SERVER_MONITORING_DICTIONARY_TEXT,
 )
 from pipeline.dedup import (
     build_metadata_rows_from_docs,
-    deduplicate_chunks_safe,
-    downselect_chunks_for_embedding,
     extract_global_evidence_profile,
-    filter_chunks_by_signal,
 )
 from pipeline.evidence import select_evidence_chunks
 from pipeline.files import format_file_size, stream_file_lines
@@ -52,13 +30,11 @@ from pipeline.query import (
     _should_try_hybrid_schema,
     build_query_filter_summary,
     classify_api_subcategory,
-    classify_query_category,
     compute_file_time_coverage,
     load_retrieval_signals,
     validate_query_window,
 )
 from pipeline.progress import emit_ui_progress
-from pipeline.scoring import _embed_documents_batched, score_anomalies
 from llm_factory import get_llm
 from artifact_paths import debug_evidence_path, ensure_parent_dir, faiss_index_dir
 
@@ -95,7 +71,6 @@ def analyze_single_file(
         Dict compatible with runner / consolidate (findings, category, metadata etc.)
     """
     file_name = os.path.basename(file_path)
-    faiss_save_dir = faiss_index_dir(file_name)
     debug_file = debug_evidence_path(file_name)
     metadata_rows: list[dict[str, Any]] = []
     selected_row_ids_for_reduce: list[str] = []
@@ -127,35 +102,11 @@ def analyze_single_file(
     retrieval_signals = load_retrieval_signals()
     query_text = str(query_context.get('query_text', '')) if query_context else ''
 
-    # Mode is the source of truth. Only run the LLM router when in api_request mode
-    # (or when the caller did not explicitly force server_monitoring).
-    if mode == "server_monitoring":
-        category = "server_monitoring"
-        route_confidence = 1.0
-        route_reason = "user-forced server_monitoring mode (router bypassed)"
-        route_fallback = False
-        print("  [Route] mode=server_monitoring (user-controlled toggle) — router skipped")
-    elif query_text:
-        category, route_confidence, route_reason, route_fallback = classify_query_category(
-            query_text,
-            retrieval_signals['category_keywords'],
-            retrieval_signals['api_known_error_keywords'],
-        )
-    else:
-        category, route_confidence, route_reason, route_fallback = (
-            'api_request',
-            1.0,
-            'empty query defaults to api_request',
-            True,
-        )
-
-    print(
-        f"  [Route] mode={mode} category={category} confidence={route_confidence:.2f} "
-        f"fallback={route_fallback} reason={route_reason}"
-    )
+    category = mode
+    print(f"  [Mode] Using user-selected analysis path: {mode}")
 
     subcategory = 'unclassified'
-    if category == 'api_request':
+    if mode == 'api_request':
         subcategory = classify_api_subcategory(query_text, retrieval_signals['api_known_error_keywords']) if query_text else 'unknown_error'
 
     # ---- 2. Detect structure ----
@@ -329,7 +280,7 @@ def analyze_single_file(
         for idx, doc in enumerate(docs):
             doc.metadata['row_id'] = f"{file_name}::{idx}"
         metadata_rows = build_metadata_rows_from_docs(docs)
-        print("  [Route] API deterministic mode active: skipping embedding + anomaly stage")
+        print("  [Mode] API deterministic mode active: skipping embedding + anomaly stage")
 
         # Evidence selection (API path)
         evidence_text, selected_row_ids_for_reduce, source_reference_map = select_evidence_chunks(
@@ -407,100 +358,15 @@ def analyze_single_file(
         print("  [LLM] Running forensic analysis (API path)...")
         emit_ui_progress("[LLM] Running forensic analysis")
 
-        # Reconstruct the classic map prompt (preserved from original logic)
-        if category == 'api_request':
-            retrieval_pipeline_text = (
-                "You receive evidence extracted via deterministic API-request parsing: \n"
-                "    1. Query-window filtering is applied before extraction\n"
-                "    2. Request/event records are selected using fixed marker and signal rules\n"
-                "    3. Thread neighbours are included for local context"
-            )
-            api_map_guardrail_text = (
-                "IMPORTANT — EVIDENCE SOURCE NOTICE: This file is being analyzed using the deterministic API-request fast-path. "
-                "The evidence consists ONLY of: • complete API request lifecycles (entry to exit) • isolated critical error lines / exceptions\n"
-                "NEVER use or mention any of the following words or concepts in your response: "
-                "chunks, chunk, chunking, embedding, embeddings, vector, vector store, FAISS, anomaly, anomaly score, z-score, "
-                "semantic similarity, kNN, distance, outlier, hierarchical chunking, time window, thread group\n"
-                "Only refer to evidence using these terms: • request • API request • request lifecycle • error line • exception • diagnostic message."
-            )
-        else:
-            retrieval_pipeline_text = (
-                "You receive log chunks selected from a signal-first retrieval pipeline:\n"
-                "    1. Signal filtering keeps IAM-critical and error-bearing chunks first\n"
-                "    2. Anomaly scoring ranks the retained chunks against the per-file baseline\n"
-                "    3. Thread/session neighbours are added for local context"
-            )
-            api_map_guardrail_text = ""
+        from pipeline.prompts_api import build_api_map_messages
 
-        system_prompt = f"""You are a senior IAM Forensic Evidence Analyst for Identity and Access Management systems.
-
-PRIMARY DUTY (Evidence First):
-Produce a complete, verifiable, machine-readable evidence summary of the ENTIRE file using the provided File-Wide Evidence Profile + selected evidence chunks. 
-All facts must come directly from the evidence. Never invent messages, properties, exception names, or user actions.
-
-SECONDARY DUTY (Analysis Second):
-Only after the evidence summary is complete, propose up to 3 ranked possible root causes. Each must be explicitly supported by verbatim quotes + [REF_ID] + thread + timestamp.
-
-STRICT RULES:
-- ONLY use information present in the File-Wide Evidence Profile or the quoted evidence chunks.
-- If a diagnostic property or configuration hint appears (e.g. file paths, property names, codes), quote it exactly.
-- Output exactly 3 sections with the headings shown below. No extra sections.
-
-OUTPUT FORMAT (Markdown – follow exactly):
-
-## 1. File-Wide Evidence Summary
-**Use exactly these sub-headers in this order (do not change the heading text or order):**
-
-### File Metadata & Global Statistics
-- File name, total lines, observed timestamp range, total error lines.
-
-### Request Lifecycle Health
-- matched_requests, unmatched_entries, unmatched_exits, error_rate.
-- List of successful API request lifecycles observed (e.g. loginEx2, authorizeForApplication, refreshSession, SAML, reAuthenticate, etc.).
-
-### Critical Signals & Exception Distribution
-- All unique exception classes with exact counts, first_seen, last_seen, and affected threads (limit to top 10 threads per exception).
-- Verbatim fully-qualified exception class names exactly as they appear in the evidence.
-
-### Primary Failure Timeline
-- Chronological list of the most important failure events with exact timestamp, thread, and one-sentence description (use the timestamps and thread names from the evidence).
-
-### Key Evidence Quotes & Diagnostic Details
-- Verbatim quotes of the most diagnostic error lines, session concurrency messages, verification failures, etc., each followed by its [REF_...] reference.
-
-### Configuration Properties & Diagnostic Entities
-- All extracted key=value properties, file paths (especially amsystem.properties, simCert.file, etc.), error codes, and other diagnostic entities — quoted exactly.
-
-### Infrastructure & Health Signals
-- Server statistics (thread pool, DB connections, JVM memory, etc.) and confirmation of no immediate resource exhaustion.
-
-## 2. Analysis Boundaries & Uncertainty
-- Clearly state what the logs do NOT contain (no successful requests, no full config files, no client-side payloads, etc.).
-- Note any limitations of the evidence (query window, error-only lines, etc.).
-
-## 3. Possible Root Causes (Ranked by Evidence Strength)
-**Cause 1 (Strongest Evidence)**: One-sentence description.
-**Supporting Evidence**:
-- Verbatim quote + [REF_...] + thread + timestamp
-**Confidence**: High / Medium / Low
-**Why not higher**: Brief honest limitation.
-
-**Cause 2**: ...
-**Cause 3** (if evidence supports a third): ...
-
-{api_map_guardrail_text}
-"""
-
-        user_prompt = f"""Analyse the following evidence from file **{file_name}**
-Category: {category}
-Subcategory: {subcategory}
-
-FILE-WIDE EVIDENCE PROFILE (entire file summary):
-{json.dumps(evidence_profile, indent=2)}
-
-SELECTED EVIDENCE CHUNKS:
-{evidence_text}
-"""
+        system_prompt, user_prompt = build_api_map_messages(
+            file_name=file_name,
+            category=category,
+            subcategory=subcategory,
+            evidence_profile=evidence_profile,
+            evidence_text=evidence_text,
+        )
 
         messages = [
             SystemMessage(content=system_prompt),

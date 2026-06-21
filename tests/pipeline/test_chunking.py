@@ -3,13 +3,6 @@ from pipeline.constants import _DEFAULT_API_REQUEST_BOUNDARIES
 from pipeline.query import load_retrieval_signals
 
 
-def test_hybrid_chunk_log(sample_log_file, sample_schema):
-    docs = c.hybrid_chunk_log(sample_log_file, sample_schema)
-    assert len(docs) > 0
-    assert all(hasattr(d, "page_content") for d in docs)
-    assert all(hasattr(d, "metadata") for d in docs)
-
-
 def test_extract_api_request_docs_on_server_log(sample_log_file, sample_schema):
     retrieval_signals = load_retrieval_signals()
     docs = c.extract_api_request_docs_deterministic(
@@ -19,11 +12,6 @@ def test_extract_api_request_docs_on_server_log(sample_log_file, sample_schema):
         retrieval_signals,
         query_context=None,
     )
-    assert isinstance(docs, list)
-
-
-def test_chunk_server_monitoring_log(sample_log_file, sample_schema):
-    docs = c.chunk_server_monitoring_log(sample_log_file, sample_schema, query_context=None)
     assert isinstance(docs, list)
 
 

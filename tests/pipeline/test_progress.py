@@ -55,5 +55,6 @@ def test_format_progress_details_block_renders_collapsible_html():
         summary_label="Pipeline progress",
     )
     assert 'class="pipeline-progress-details"' in block
-    assert "Pipeline progress (2 steps)" in block
+    assert "Pipeline progress (2 steps)" not in block
+    assert "<summary>Pipeline progress</summary>" in block
     assert "Sampling lines for schema detection..." in block

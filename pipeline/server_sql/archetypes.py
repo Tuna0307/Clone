@@ -182,17 +182,9 @@ ARCHETYPE_TAXONOMY: dict[IncidentArchetype, ArchetypeDefinition] = {
 
 def format_archetype_taxonomy_for_prompt() -> str:
     """Render the taxonomy as markdown for injection into LLM prompts."""
-    lines = ["## Incident Archetype Taxonomy (authoritative)\n"]
-    for archetype in ALL_ARCHETYPES:
-        defn = ARCHETYPE_TAXONOMY[archetype]
-        lines.append(f"### {archetype}")
-        lines.append("**Key signals:** " + "; ".join(defn["key_signals"]))
-        lines.append("**Typical symptoms:** " + "; ".join(defn["typical_symptoms"]))
-        lines.append("**Common red herrings:** " + "; ".join(defn["common_red_herrings"]))
-        lines.append("**Investigation focus:** " + "; ".join(defn["investigation_focus"]))
-        lines.append("**Competing archetypes to test:** " + ", ".join(defn["competing_archetypes"]))
-        lines.append("")
-    return "\n".join(lines)
+    from pipeline.prompt_loader import load_fragment
+
+    return load_fragment("reference.archetype_taxonomy")
 
 
 def get_investigation_focus(archetype: IncidentArchetype) -> list[str]:
@@ -201,3 +193,17 @@ def get_investigation_focus(archetype: IncidentArchetype) -> list[str]:
 
 def get_common_red_herrings(archetype: IncidentArchetype) -> list[str]:
     return list(ARCHETYPE_TAXONOMY[archetype]["common_red_herrings"])
+
+
+def investigation_focus_text(archetype: IncidentArchetype) -> str:
+    """LLM-facing investigation focus prose from pipeline.prompt_loader."""
+    from pipeline.prompt_loader import load_fragment
+
+    return load_fragment(f"reference.archetype.{archetype}.investigation_focus")
+
+
+def common_red_herrings_text(archetype: IncidentArchetype) -> str:
+    """LLM-facing red herring hints from pipeline.prompt_loader."""
+    from pipeline.prompt_loader import load_fragment
+
+    return load_fragment(f"reference.archetype.{archetype}.red_herrings")
